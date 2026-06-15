@@ -13,6 +13,7 @@ import type {
   WelfareRewardSystemPlugin,
 } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
+import type { MessageStore } from "../../message-store.js";
 import { DEFAULT_MMORPG_CONTENT } from "./default-content.js";
 import {
   MMORPG_RULEBOOK,
@@ -230,6 +231,7 @@ export function createMMORPGFrameworkPlugin(
   inventory: InventoryPlugin,
   social: SocialPlugin,
   menuPlugin: MenuPlugin,
+  messageStore: MessageStore,
   welfare?: WelfareRewardSystemPlugin
 ): MMORPGFrameworkPlugin {
   let ctxRef: PluginContext | null = null;
@@ -286,7 +288,7 @@ export function createMMORPGFrameworkPlugin(
 
     async onLoad(ctx) {
       ctxRef = ctx;
-      stateStore = new MMORPGStateStore(path.resolve(process.cwd(), ctx.config.pluginSettings.mmorpgFramework.dataFile));
+      stateStore = new MMORPGStateStore(messageStore);
       validationReport = validateMMORPGContent(DEFAULT_MMORPG_CONTENT);
       registerFrameworkItems();
       // Initialize the runtime singleton so extracted framework modules can
@@ -2315,7 +2317,7 @@ ${menuBody}
         const gender = DEFAULT_MMORPG_CONTENT.genders[player.genderId];
 
         // Get group nickname from OneBot sender
-        const sender = message.raw.sender as { card?: string; nickname?: string } | undefined;
+        const sender = (message.raw as { sender?: { card?: string; nickname?: string } } | undefined)?.sender;
         const groupName = sender?.card?.trim() || sender?.nickname?.trim() || message.userId;
 
         const prompt = [

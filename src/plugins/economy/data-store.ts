@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { UserProfile, ItemDef, DataStorePlugin } from "../../types.js";
-
-const DATA_FILE = path.resolve(process.cwd(), "data", "plugins.json");
+import type { MessageStore } from "../../message-store.js";
 
 const DEFAULT_ITEMS: ItemDef[] = [
   { id: "rose", name: "玫瑰", description: "表达爱意的红玫瑰", price: 10 },
@@ -11,11 +10,6 @@ const DEFAULT_ITEMS: ItemDef[] = [
   { id: "ring", name: "戒指", description: "闪亮的戒指", price: 100 },
   { id: "card", name: "贺卡", description: "写满祝福的贺卡", price: 5 },
 ];
-
-type StoreData = {
-  users: Record<string, UserProfile>;
-  items: ItemDef[];
-};
 
 function defaultProfile(): UserProfile {
   return {
@@ -26,31 +20,78 @@ function defaultProfile(): UserProfile {
     inventory: {},
     affinity: { ai: 0, users: {} },
     interactionStats: {
-      ai: {
-        gifts: 0,
-        chats: 0,
-      },
+      ai: { gifts: 0, chats: 0 },
       users: {},
     },
   };
 }
 
-let saveTimer: NodeJS.Timeout | null = null;
+export function createDataStorePlugin(messageStore: MessageStore): DataStorePlugin {
+  const users = new Map<string, UserProfile>();
+  let items: ItemDef[] = [];
+  let saveTimer: NodeJS.Timeout | null = null;
+  const dirtyUsers = new Set<string>();
 
-export function createDataStorePlugin(): DataStorePlugin {
-  let data: StoreData = loadData();
+  // ── Load data (SQLite + JSON auto-migration) ────────────────────────
+  function loadData() {
+    // Auto-migrate from legacy JSON if it exists
+    const jsonPath = path.resolve(process.cwd(), "data", "plugins.json");
+    if (fs.existsSync(jsonPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(jsonPath, "utf-8")) as { users?: Record<string, UserProfile>; items?: ItemDef[] };
+        const legacyUsers = raw.users ?? {};
+        const userKeys = Object.keys(legacyUsers);
+        if (userKeys.length > 0) {
+          console.log(`[DataStore] 检测到旧版 plugins.json（${userKeys.length} 个用户），开始迁移至 SQLite…`);
+          for (const [userId, profile] of Object.entries(legacyUsers)) {
+            messageStore.saveUserProfile(userId, ensureProfileShape(profile));
+          }
+          console.log("[DataStore] plugins.json 用户数据迁移完成");
+        }
+        if (raw.items && raw.items.length > 0) {
+          for (const item of raw.items) {
+            messageStore.saveItemDef(item);
+          }
+          console.log(`[DataStore] plugins.json 物品定义迁移完成（${raw.items.length} 个）`);
+        }
+        fs.renameSync(jsonPath, jsonPath + ".archived");
+        console.log("[DataStore] plugins.json 已归档为 .archived");
+      } catch (error) {
+        console.error("[DataStore] 迁移 plugins.json 失败:", error);
+      }
+    }
 
-  function writeToDisk() {
-    const dir = path.dirname(DATA_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
+    // Load from SQLite
+    const profiles = messageStore.getAllUserProfiles();
+    for (const { userId, profile } of profiles) {
+      users.set(userId, ensureProfileShape(profile));
+    }
+
+    const dbItems = messageStore.getAllItemDefs();
+    items = dbItems.length > 0 ? dbItems : [...DEFAULT_ITEMS];
+
+    // If SQLite had no items, persist defaults
+    if (dbItems.length === 0) {
+      for (const item of DEFAULT_ITEMS) {
+        messageStore.saveItemDef(item);
+      }
+    }
   }
 
+  loadData();
+
+  // ── Debounced persist (only dirty profiles) ─────────────────────────
   function persist() {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       try {
-        writeToDisk();
+        for (const userId of dirtyUsers) {
+          const profile = users.get(userId);
+          if (profile) {
+            messageStore.saveUserProfile(userId, profile);
+          }
+        }
+        dirtyUsers.clear();
       } catch (error) {
         console.error("[DataStore] 保存失败:", error);
       } finally {
@@ -61,19 +102,23 @@ export function createDataStorePlugin(): DataStorePlugin {
 
   return {
     name: "data-store",
-    description: "经济与社交系统的数据持久化存储",
+    description: "经济与社交系统的数据持久化存储（SQLite）",
 
     getUserData(userId: string): UserProfile {
-      if (!data.users[userId]) {
-        data.users[userId] = defaultProfile();
+      if (!users.has(userId)) {
+        users.set(userId, defaultProfile());
+        dirtyUsers.add(userId);
         persist();
       }
-      data.users[userId] = ensureProfileShape(data.users[userId]);
-      return data.users[userId];
+      const profile = ensureProfileShape(users.get(userId)!);
+      users.set(userId, profile);
+      return profile;
     },
 
     saveUserData(userId: string, profile: UserProfile) {
-      data.users[userId] = ensureProfileShape(profile);
+      const shaped = ensureProfileShape(profile);
+      users.set(userId, shaped);
+      dirtyUsers.add(userId);
       persist();
     },
 
@@ -83,41 +128,35 @@ export function createDataStorePlugin(): DataStorePlugin {
         saveTimer = null;
       }
       try {
-        writeToDisk();
+        for (const userId of dirtyUsers) {
+          const profile = users.get(userId);
+          if (profile) {
+            messageStore.saveUserProfile(userId, profile);
+          }
+        }
+        dirtyUsers.clear();
       } catch (error) {
         console.error("[DataStore] 立即保存失败:", error);
       }
     },
 
     getAllUserEntries() {
-      return Object.entries(data.users).map(([userId, profile]) => ({ userId, profile }));
+      return Array.from(users.entries()).map(([userId, profile]) => ({ userId, profile }));
     },
 
     getItem(itemId: string): ItemDef | undefined {
-      return data.items.find((item) => item.id === itemId);
+      return items.find((item) => item.id === itemId);
     },
 
     getAllItems(): ItemDef[] {
-      return [...data.items];
+      return [...items];
     },
 
     addItem(item: ItemDef) {
-      data.items.push(item);
-      persist();
+      items.push(item);
+      messageStore.saveItemDef(item);
     },
   };
-}
-
-function loadData(): StoreData {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, "utf-8");
-      return JSON.parse(raw) as StoreData;
-    }
-  } catch (error) {
-    console.error("[DataStore] 读取失败，使用默认数据:", error);
-  }
-  return { users: {}, items: [...DEFAULT_ITEMS] };
 }
 
 function ensureProfileShape(profile: UserProfile): UserProfile {

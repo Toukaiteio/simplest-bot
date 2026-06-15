@@ -215,6 +215,19 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     };
   }
 
+  async getGroupMemberList(groupId: string): Promise<Array<{ userId: string; nickname?: string; card?: string; role?: string }>> {
+    const result = await this.sendAction("get_group_member_list", { group_id: groupId, no_cache: false });
+    if (!result || typeof result !== "object") return [];
+    const data = (result as { data?: unknown }).data;
+    if (!Array.isArray(data)) return [];
+    return data.map((entry: Record<string, unknown>) => ({
+      userId: String(entry.user_id ?? ""),
+      nickname: typeof entry.nickname === "string" ? entry.nickname : undefined,
+      card: typeof entry.card === "string" ? entry.card : undefined,
+      role: typeof entry.role === "string" ? entry.role : undefined,
+    }));
+  }
+
   async getFriendList(): Promise<Array<{ userId: string; nickname?: string; remark?: string }>> {
     const result = await this.sendAction("get_friend_list", {});
     if (!result || typeof result !== "object") return [];
@@ -513,7 +526,7 @@ function extractText(event: OneBotInboundEvent) {
           const fileId = String(segment.data.file ?? "");
           return name ? `[文件 file=${encodeMediaId(fileId)}：${name}]` : mediaPlaceholder("文件", fileId);
         }
-        return `[未知消息类型：${segment.type}]`;
+        return "";
       })
       .join("")
       .trim();
@@ -731,7 +744,7 @@ function cqStringToText(value: string) {
       const fileId = p.file ?? "";
       return p.name ? `[文件 file=${encodeMediaId(fileId)}：${p.name}]` : mediaPlaceholder("文件", fileId);
     })
-    .replace(/\[CQ:([a-zA-Z0-9_]+),?[^\]]*\]/g, (_match, type: string) => `[未知消息类型：${type}]`)
+    .replace(/\[CQ:([a-zA-Z0-9_]+),?[^\]]*\]/g, "")
     .trim();
 }
 

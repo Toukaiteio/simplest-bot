@@ -84,6 +84,15 @@ export type BuildContextOptions = {
 
   /** 当前群聊上下文（群名、发送者群名片等） */
   groupContext?: GroupContext;
+
+  /** 持久化的对话历史，用于在首次构建上下文时填充 working chunks */
+  conversationHistory?: HistoryMessage[];
+};
+
+/** 对话历史消息（与 MemoryMessage 结构一致，避免 context 模块依赖 memory 模块） */
+export type HistoryMessage = {
+  role: "user" | "assistant" | "system";
+  content: string;
 };
 
 export type GroupMemberInfo = {

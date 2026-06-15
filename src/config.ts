@@ -18,7 +18,7 @@ export function loadConfig(): BotConfig {
   const config = botConfigSchema.parse(raw);
 
   // 自动补全已安装插件的启用状态（默认 true）
-  const installedPlugins = ["blacklist", "groupTrigger", "reply", "atMention", "split", "debounce", "webfetch", "dailyReport", "fileWorkspace", "adminAssist", "todo", "mmorpgFramework"];
+  const installedPlugins = ["blacklist", "groupTrigger", "reply", "atMention", "split", "debounce", "webfetch", "dailyReport", "fileWorkspace", "adminAssist", "todo", "mmorpgFramework", "chatSearch"];
   installedPlugins.forEach(name => {
     if (!(name in config.plugins)) {
       (config.plugins as Record<string, boolean>)[name] = true;

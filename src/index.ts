@@ -28,6 +28,8 @@ import { createSystemPlugin } from "./plugins/system/system-plugin.js";
 import { createIdentityPlugin } from "./plugins/system/identity-plugin.js";
 import { createAdminAssistPlugin } from "./plugins/system/admin-assist-plugin.js";
 import { createTodoPlugin } from "./plugins/system/todo-plugin.js";
+import { createChatSearchPlugin } from "./plugins/system/chat-search-plugin.js";
+import { createTimePlugin } from "./plugins/system/time-plugin.js";
 import { createDailyReportPlugin, type DailyReportPlugin } from "./plugins/reporting/daily-report-plugin.js";
 import { createFileWorkspacePlugin } from "./plugins/system/file-workspace-plugin.js";
 import { createWebFetchPlugin, webfetchToolRegistration } from "./plugins/webfetch.js";
@@ -49,8 +51,11 @@ async function main() {
   console.log("[Config] 配置已加载");
 
   const messageStore = new MessageStore();
+  process.on("exit", () => messageStore.close());
+  process.on("SIGINT", () => { messageStore.close(); process.exit(); });
+  process.on("SIGTERM", () => { messageStore.close(); process.exit(); });
   const memory = new MemoryManager(config.memory, messageStore);
-  await memory.init(config.llm);
+  await memory.init();
   const onebot = new OneBotClient(config.oneBot);
 
   const pluginManager = new PluginManager();
@@ -67,7 +72,7 @@ async function main() {
   pluginManager.setContext(pluginContext);
 
   // ========== 核心插件（依赖注入顺序） ==========
-  const store: DataStorePlugin = createDataStorePlugin();
+  const store: DataStorePlugin = createDataStorePlugin(messageStore);
   pluginManager.register(store);
 
   const coreCmd = createCoreCommandPlugin(config.auth, config.pluginSettings.coreCommand.prefix);
@@ -76,10 +81,12 @@ async function main() {
   const menu: MenuPlugin = createMenuPlugin(coreCmd);
   pluginManager.register(menu);
 
+  pluginManager.register(createTimePlugin());
+
   const inventory: InventoryPlugin = createInventoryPlugin(store);
   pluginManager.register(inventory);
 
-  const social: SocialPlugin = createSocialPlugin(store, menu, messageStore);
+  const social: SocialPlugin = createSocialPlugin(store, menu, messageStore, onebot);
   pluginManager.register(social);
 
   const checkin: CheckinPlugin = createCheckinPlugin(store, social, menu);
@@ -104,10 +111,12 @@ async function main() {
   if (config.plugins.adminAssist) pluginManager.register(adminAssistPlugin);
   const todoPlugin = createTodoPlugin(menu);
   if (config.plugins.todo) pluginManager.register(todoPlugin);
-  const mmorpgFrameworkPlugin = createMMORPGFrameworkPlugin(store, inventory, social, menu, rewardSystem);
+  const mmorpgFrameworkPlugin = createMMORPGFrameworkPlugin(store, inventory, social, menu, messageStore, rewardSystem);
   if (config.plugins.mmorpgFramework) pluginManager.register(mmorpgFrameworkPlugin);
   pluginManager.register(createIdentityPlugin(onebot, menu, config.auth.adminUserIds));
   pluginManager.register(createSystemPlugin(memory, pluginManager, blacklistPlugin, groupTriggerPlugin, menu));
+  const chatSearchPlugin = createChatSearchPlugin(messageStore, menu);
+  if (config.plugins.chatSearch) pluginManager.register(chatSearchPlugin);
   let dailyReportPlugin: DailyReportPlugin | null = null;
   if (config.plugins.dailyReport) {
     dailyReportPlugin = createDailyReportPlugin(messageStore, menu);
@@ -145,6 +154,16 @@ async function main() {
   if (config.llm.supportsVoice) mediaNotes.push("语音占位符格式为 [语音 file=ID]，可调用 view_voice 工具获取语音文件信息。");
   if (mediaNotes.length > 0) {
     config.llm.systemPrompt += "\n\n" + mediaNotes.join("\n");
+  }
+
+  // Inline fact extraction instruction (Plan A: zero extra API calls)
+  if (config.memory.extraction.enabled) {
+    config.llm.systemPrompt += [
+      "",
+      "当你从用户消息中识别到关于用户的持久性事实（姓名、年龄、所在地、职业、爱好、偏好、重要经历、人际关系等），请在回复末尾以 HTML 注释格式附加提取结果：",
+      "<!-- facts: [\"事实1\", \"事实2\"] -->",
+      "规则：只提取独立、自包含的个人事实（每条 15 字以内为佳）；不提取临时情绪或对话中显而易见的内容；如果与已知记忆重复或没有新事实，输出空数组 []。",
+    ].join("\n");
   }
 
   const contextManager = new ContextManager(
@@ -186,7 +205,24 @@ async function main() {
         return null;
       }
     },
-    async (forwardId) => onebot.getForwardMessageText(forwardId, 2000)
+    async (forwardId) => onebot.getForwardMessageText(forwardId, 2000),
+    async (userId, limit) => {
+      const records = messageStore.queryInteraction(userId, { order: "desc", limit });
+      if (records.length === 0) return null;
+      const sorted = [...records].sort((a, b) => a.timestamp - b.timestamp);
+      const lines = sorted.map((rec) => {
+        const d = new Date(rec.timestamp);
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const time = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        const scope = rec.type === "group" && rec.groupId
+          ? `群${rec.groupId}`
+          : rec.type === "private" ? "私聊" : "";
+        const sender = rec.isBot ? "Bot" : `用户(${rec.userId ?? "?"})`;
+        const text = rec.text.length > 120 ? rec.text.slice(0, 120) + "…" : rec.text;
+        return `[${time}] ${scope} · ${sender}: ${text}`;
+      });
+      return `[近期互动回顾]\n${lines.join("\n")}`;
+    }
   );
   console.log(`[LLM] 模型: ${config.llm.model}`);
 
@@ -223,6 +259,7 @@ async function main() {
 
   // 注册工具
   const toolRegistrations: BotToolRegistration[] = [];
+  toolRegistrations.push(...social.getToolRegistrations());
   if (config.plugins.fileWorkspace) {
     toolRegistrations.push(...fileWorkspacePlugin.getToolRegistrations());
   }
@@ -264,6 +301,9 @@ async function main() {
   }
   if (config.plugins.mmorpgFramework) {
     toolRegistrations.push(...mmorpgFrameworkPlugin.getToolRegistrations());
+  }
+  if (config.plugins.chatSearch) {
+    toolRegistrations.push(...chatSearchPlugin.getToolRegistrations());
   }
   toolRegistrations.push(
     ...createMediaToolRegistrations(onebot, {

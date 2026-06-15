@@ -1138,6 +1138,7 @@ function formatMentionFallback(userId: string): string {
 }
 
 function getRawSender(message: BotMessage): { card?: unknown; nickname?: unknown } {
+  if (!message.raw) return {};
   const sender = message.raw.sender;
   if (!sender || typeof sender !== "object") {
     return {};

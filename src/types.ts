@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { BotToolRegistration } from "./tooling.js";
 
 // ==================== OneBot v11 类型 ====================
 
@@ -64,12 +65,11 @@ export const llmConfigSchema = z.object({
 
 export const memoryConfigSchema = z.object({
   enabled: z.boolean().default(true),
-  provider: z.enum(["mem0", "simple"]).default("mem0"),
-  mem0ApiKey: z.string().default(""),
-  mem0BaseUrl: z.string().optional(),
-  mem0EmbeddingModel: z.string().optional(),
-  mem0EmbeddingDimension: z.number().int().positive().optional(),
   maxHistoryLength: z.number().int().positive().default(20),
+  extraction: z.object({
+    enabled: z.boolean().default(false),
+    turnsThreshold: z.number().int().positive().default(8),
+  }).default({}),
 });
 
 export const authConfigSchema = z.object({
@@ -97,6 +97,7 @@ export const pluginsConfigSchema = z.object({
   adminAssist: z.boolean().default(true),
   todo: z.boolean().default(true),
   mmorpgFramework: z.boolean().default(true),
+  chatSearch: z.boolean().default(true),
 });
 
 export const contextManagementConfigSchema = z.object({
@@ -416,6 +417,8 @@ export type SocialPlugin = Plugin & {
     userId: string,
     targetId?: string
   ) => { gifts: number; mentions: number; replies: number; chats: number };
+  getToolRegistrations: () => BotToolRegistration[];
+  getAffinityMultiplier: (userId: string) => number;
 };
 
 export type CheckinPlugin = Plugin & {

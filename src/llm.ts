@@ -9,6 +9,9 @@ import type { BuildContextOptions, GroupContext } from "./context/types.js";
 
 const ASSISTANT_PREFIX = /^(?:\[ASSISTANT\]|ASSISTANT\])[\s\n]*/;
 
+/** Matches <!-- facts: [...] --> anywhere in the response (greedy-safe with lazy quantifier). */
+const FACTS_COMMENT_REGEX = /<!--\s*facts:\s*(\[[\s\S]*?\])\s*-->/;
+
 export class LLMClient {
   private chatModel: ChatOpenAI;
   private config: LLMConfig;
@@ -21,6 +24,7 @@ export class LLMClient {
   private resolveReferencedMessage?: (messageId: string) => Promise<BotMessage | null>;
   private resolveForwardMessage?: (forwardId: string) => Promise<string | null>;
   private resolveGroupContext?: (message: BotMessage) => Promise<GroupContext | null>;
+  private resolveInteractionHistory?: (userId: string, limit: number) => Promise<string | null>;
 
   constructor(
     config: LLMConfig,
@@ -29,7 +33,8 @@ export class LLMClient {
     truncateThreshold = 2000,
     resolveReferencedMessage?: (messageId: string) => Promise<BotMessage | null>,
     resolveGroupContext?: (message: BotMessage) => Promise<GroupContext | null>,
-    resolveForwardMessage?: (forwardId: string) => Promise<string | null>
+    resolveForwardMessage?: (forwardId: string) => Promise<string | null>,
+    resolveInteractionHistory?: (userId: string, limit: number) => Promise<string | null>
   ) {
     this.config = config;
     this.memory = memory;
@@ -59,6 +64,7 @@ export class LLMClient {
     this.resolveReferencedMessage = resolveReferencedMessage;
     this.resolveGroupContext = resolveGroupContext;
     this.resolveForwardMessage = resolveForwardMessage;
+    this.resolveInteractionHistory = resolveInteractionHistory;
   }
 
   setTools(registrations: BotToolRegistration[]) {
@@ -110,6 +116,11 @@ export class LLMClient {
     const sessionKey = this.getSessionKey(message);
     const contextOptions = await this.buildContextOptions(message, memories, dynamicPromptAppends);
 
+    // 仅在首次构建时注入对话历史，避免每次调用都查询
+    if (!this.contextManager.isSeeded(sessionKey)) {
+      contextOptions.conversationHistory = this.memory.getConversationHistory(message);
+    }
+
     this.truncatedTexts.clear();
 
     const contextResult = await this.contextManager.buildContext(sessionKey, contextOptions);
@@ -117,12 +128,23 @@ export class LLMClient {
 
     try {
       let content = await this.invokeWithTools(promptMessages, { mode: "single", message });
+
+      // Parse and strip inline fact extraction before other post-processing
+      const extractedFacts = this.parseInlineFacts(content);
+      content = content.replace(FACTS_COMMENT_REGEX, "").trimEnd();
       content = content.replace(ASSISTANT_PREFIX, "");
 
       this.contextManager.appendAssistantResponse(sessionKey, content);
       this.memory.addMessage(message, content).catch(err =>
         console.error("[LLM] 存储记忆失败:", err)
       );
+
+      // Async save extracted facts (fire-and-forget)
+      if (extractedFacts.length > 0 && message.userId) {
+        this.memory.saveExtractedFacts(message.userId, extractedFacts).catch(err =>
+          console.error("[LLM] 保存提取事实失败:", err)
+        );
+      }
 
       return content;
     } catch (error) {
@@ -139,6 +161,11 @@ export class LLMClient {
     const sessionKey = this.getSessionKey(primary);
     const contextOptions = await this.buildBatchContextOptions(messages, memories, dynamicPromptAppends);
 
+    // 仅在首次构建时注入对话历史，避免每次调用都查询
+    if (!this.contextManager.isSeeded(sessionKey)) {
+      contextOptions.conversationHistory = this.memory.getConversationHistory(primary);
+    }
+
     this.truncatedTexts.clear();
 
     const contextResult = await this.contextManager.buildContext(sessionKey, contextOptions);
@@ -146,12 +173,23 @@ export class LLMClient {
 
     try {
       let content = await this.invokeWithTools(promptMessages, { mode: "batch", messages });
+
+      // Parse and strip inline fact extraction before other post-processing
+      const extractedFacts = this.parseInlineFacts(content);
+      content = content.replace(FACTS_COMMENT_REGEX, "").trimEnd();
       content = content.replace(ASSISTANT_PREFIX, "");
 
       this.contextManager.appendAssistantResponse(sessionKey, content);
       this.memory.addBatch(messages, content).catch(err =>
         console.error("[LLM] 批量存储记忆失败:", err)
       );
+
+      // Async save extracted facts for all users in the batch
+      if (extractedFacts.length > 0 && primary.userId) {
+        this.memory.saveExtractedFacts(primary.userId, extractedFacts).catch(err =>
+          console.error("[LLM] 保存提取事实失败:", err)
+        );
+      }
 
       return content;
     } catch (error) {
@@ -181,10 +219,13 @@ export class LLMClient {
     memories: string[],
     dynamicPromptAppends?: string[]
   ): Promise<BuildContextOptions> {
-    const [referenceText, groupContext, forwardText] = await Promise.all([
+    const [referenceText, groupContext, forwardText, interactionHistory] = await Promise.all([
       this.buildReferenceText(message),
       this.resolveGroupContext?.(message) ?? null,
       message.forwardId ? this.buildForwardText(message.forwardId) : Promise.resolve(""),
+      message.type === "private" && message.userId && this.resolveInteractionHistory
+        ? this.resolveInteractionHistory(message.userId, 8)
+        : Promise.resolve(null),
     ]);
     const displayText = this.maybeTruncate(message.text, "current");
     const parts = [
@@ -194,6 +235,12 @@ export class LLMClient {
     ].filter(Boolean);
     const triggerText = parts.join("\n");
 
+    // 私聊时注入近期互动历史
+    const appends = [...(dynamicPromptAppends ?? [])];
+    if (interactionHistory) {
+      appends.unshift(interactionHistory);
+    }
+
     return {
       triggerMessage: {
         userId: message.userId,
@@ -202,10 +249,10 @@ export class LLMClient {
         replyToMessageId: message.replyToMessageId,
         timestamp: Date.now(),
       },
-      speakerMemories: message.userId
+      speakerMemories: message.userId && memories.length > 0
         ? [{ userId: message.userId, memories, memoryIds: memories.map((m) => `mem-${m.slice(0, 32)}`) }]
         : undefined,
-      dynamicSystemAppends: dynamicPromptAppends,
+      dynamicSystemAppends: appends.length > 0 ? appends : undefined,
       groupContext: groupContext ?? undefined,
     };
   }
@@ -261,7 +308,7 @@ export class LLMClient {
         timestamp: Date.now(),
       },
       surroundingMessages: surrounding,
-      speakerMemories: trigger.userId
+      speakerMemories: trigger.userId && memories.length > 0
         ? [{ userId: trigger.userId, memories, memoryIds: memories.map((m) => `mem-${m.slice(0, 32)}`) }]
         : undefined,
       dynamicSystemAppends: dynamicPromptAppends,
@@ -295,6 +342,19 @@ export class LLMClient {
     const content = await this.resolveForwardMessage(forwardId);
     if (!content) return "（转发内容不可见或已过期）";
     return content;
+  }
+
+  /** Parse inline <!-- facts: [...] --> from LLM response and return extracted fact strings. */
+  private parseInlineFacts(content: string): string[] {
+    const match = content.match(FACTS_COMMENT_REGEX);
+    if (!match) return [];
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+    } catch {
+      return [];
+    }
   }
 
   private getSessionKey(message: BotMessage): string {

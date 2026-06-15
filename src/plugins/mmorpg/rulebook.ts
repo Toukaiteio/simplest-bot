@@ -56,6 +56,28 @@ export const MMORPG_RULEBOOK = {
     /** Maximum daily gifts a user can send. */
     dailyGiftLimit: 10,
   },
+  behavior: {
+    /** AI affinity threshold for daily group greeting. */
+    greetingThreshold: 5000,
+    /** AI affinity threshold for cute language style. */
+    cuteLanguageThreshold: 2000,
+    /** AI affinity threshold for max-intimacy language style. */
+    maxCuteThreshold: 8000,
+
+    /** Cooldown (conversation rounds) after using ±5 affinity tool. */
+    cooldownTiny: 1,
+    /** Cooldown (conversation rounds) after using ±100 affinity tool. */
+    cooldownNormal: 5,
+    /** Cooldown (conversation rounds) after using ±1000 affinity tool. */
+    cooldownMajor: 30,
+
+    /** Max absolute delta for tiny affinity tool. */
+    toolTinyMax: 5,
+    /** Max absolute delta for normal affinity tool. */
+    toolNormalMax: 100,
+    /** Max absolute delta for major affinity tool. */
+    toolMajorMax: 1000,
+  },
   monster: {
     poolBaseRefreshMinutes: 2,       // base minutes for one monster slot to regenerate
     poolMinRefreshMinutes: 0.5,      // floor: fastest refresh with max players nearby

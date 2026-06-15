@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createBaseResources, createBaseStats, getExpRequiredForLevel } from "./rulebook.js";
 import { DEFAULT_MMORPG_CONTENT } from "./default-content.js";
 import type { ClassDef, GuildState, MailState, MarriageProposalState, MarketListing, MMORPGState, MonsterPoolEntry, PartyState, PlayerState, ResourcePoolEntry, StatBlock, WorldState } from "./schema.js";
+import type { MessageStore } from "../../message-store.js";
 
 
 const EMPTY_WORLD_STATE = {
@@ -14,11 +15,19 @@ const EMPTY_WORLD_STATE = {
   updatedAt: new Date(0).toISOString(),
 };
 
+/** Entity category names used as the first column in mmorpg_entities table. */
+const CATEGORIES = ["players", "guilds", "parties", "marriageProposals", "marketListings", "mails"] as const;
+
 export class MMORPGStateStore {
   private state: MMORPGState;
   private saveTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly filePath: string) {
+  // Dirty tracking for debounced SQLite persistence
+  private dirtyCategories = new Set<string>();
+  private deletedEntities = new Set<string>(); // "category:id"
+  private worldDirty = false;
+
+  constructor(private readonly messageStore: MessageStore) {
     this.state = this.load();
   }
 
@@ -97,6 +106,7 @@ export class MMORPGStateStore {
     };
 
     this.state.players[userId] = player;
+    this.markDirty("players");
     this.persistSoon();
     return player;
   }
@@ -104,6 +114,7 @@ export class MMORPGStateStore {
   savePlayer(player: PlayerState) {
     player.updatedAt = new Date().toISOString();
     this.state.players[player.userId] = player;
+    this.markDirty("players");
     this.persistSoon();
   }
 
@@ -114,6 +125,7 @@ export class MMORPGStateStore {
     }
     player.currencies.gold = gold;
     player.updatedAt = new Date().toISOString();
+    this.markDirty("players");
     this.persistSoon();
   }
 
@@ -125,6 +137,7 @@ export class MMORPGStateStore {
     player.currencies.gold = resultingGoldBalance;
     player.coinsEarnedFromMMO += amount;
     player.updatedAt = new Date().toISOString();
+    this.markDirty("players");
     this.persistSoon();
   }
 
@@ -135,6 +148,7 @@ export class MMORPGStateStore {
   saveWorld(world: WorldState) {
     world.updatedAt = new Date().toISOString();
     this.state.world = world;
+    this.worldDirty = true;
     this.persistSoon();
   }
 
@@ -148,11 +162,13 @@ export class MMORPGStateStore {
 
   saveParty(party: PartyState) {
     this.state.parties[party.id] = party;
+    this.markDirty("parties");
     this.persistSoon();
   }
 
   removeParty(partyId: string) {
     delete this.state.parties[partyId];
+    this.markDeleted("parties", partyId);
     this.persistSoon();
   }
 
@@ -163,6 +179,7 @@ export class MMORPGStateStore {
       ...input,
     };
     this.state.parties[party.id] = party;
+    this.markDirty("parties");
     this.persistSoon();
     return party;
   }
@@ -184,12 +201,14 @@ export class MMORPGStateStore {
       ...input,
     };
     this.state.marriageProposals[proposal.id] = proposal;
+    this.markDirty("marriageProposals");
     this.persistSoon();
     return proposal;
   }
 
   removeMarriageProposal(proposalId: string) {
     delete this.state.marriageProposals[proposalId];
+    this.markDeleted("marriageProposals", proposalId);
     this.persistSoon();
   }
 
@@ -211,27 +230,32 @@ export class MMORPGStateStore {
       createdAt: new Date().toISOString(),
     };
     this.state.guilds[guild.id] = guild;
+    this.markDirty("guilds");
     this.persistSoon();
     return guild;
   }
 
   saveGuild(guild: GuildState) {
     this.state.guilds[guild.id] = guild;
+    this.markDirty("guilds");
     this.persistSoon();
   }
 
   removeGuild(guildId: string) {
     delete this.state.guilds[guildId];
+    this.markDeleted("guilds", guildId);
     this.persistSoon();
   }
 
   saveMarketListing(listing: MarketListing) {
     this.state.marketListings[listing.id] = listing;
+    this.markDirty("marketListings");
     this.persistSoon();
   }
 
   removeMarketListing(listingId: string) {
     delete this.state.marketListings[listingId];
+    this.markDeleted("marketListings", listingId);
     this.persistSoon();
   }
 
@@ -256,25 +280,29 @@ export class MMORPGStateStore {
       createdAt: new Date().toISOString(),
     };
     this.state.mails[mail.id] = mail;
+    this.markDirty("mails");
     this.persistSoon();
     return mail;
   }
 
   saveMail(mail: MailState) {
     this.state.mails[mail.id] = mail;
+    this.markDirty("mails");
     this.persistSoon();
   }
 
   removeMail(mailId: string) {
     delete this.state.mails[mailId];
+    this.markDeleted("mails", mailId);
     this.persistSoon();
   }
 
   /**
-   * 数据迁移：重置所有玩家进度（保留角色身份），并为每位玩家记录
-   * 补偿经验值（重置前总经验的 1/10），在重新完成新手引导后以经验瓶发放。
+   * Data migration: reset all player progress (preserve character identity),
+   * record compensation exp (1/10 of pre-reset total) to be granted as exp bottles
+   * after re-completing the guide.
    *
-   * 调用一次即可，幂等——已重置的玩家（level === 1 且 pendingCompensationExp 存在）不会重复处理。
+   * Idempotent - players with pendingCompensationExp already set are skipped.
    */
   migrateResetAllPlayers(): { reset: number; skipped: number } {
     const zeroRebirthBonus: StatBlock = {
@@ -359,6 +387,13 @@ export class MMORPGStateStore {
     this.state.marketListings = {};
     this.state.mails = {};
 
+    // Mark all affected categories as dirty
+    this.markDirty("players");
+    this.markDirty("parties");
+    this.markDirty("marriageProposals");
+    this.markDirty("marketListings");
+    this.markDirty("mails");
+
     this.persistSoon();
     return { reset: resetCount, skipped: skippedCount };
   }
@@ -371,14 +406,92 @@ export class MMORPGStateStore {
     this.persistNow();
   }
 
+  // ── Private helpers ──────────────────────────────────────────────────────
+
+  private markDirty(category: string) {
+    this.dirtyCategories.add(category);
+  }
+
+  private markDeleted(category: string, entityId: string) {
+    this.deletedEntities.add(`${category}:${entityId}`);
+  }
+
   private load(): MMORPGState {
+    // Auto-migrate from legacy JSON if it exists
+    const jsonPath = path.resolve(process.cwd(), "data", "mmorpg-state.json");
+    if (fs.existsSync(jsonPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(jsonPath, "utf-8")) as Partial<MMORPGState>;
+        const migrated = normalizeState(raw);
+        console.log("[MMORPG] Detected legacy mmorpg-state.json, migrating to SQLite...");
+
+        // Write all entities to SQLite
+        for (const [userId, player] of Object.entries(migrated.players)) {
+          this.messageStore.saveMMORPGEntity("players", userId, player);
+        }
+        for (const [id, guild] of Object.entries(migrated.guilds)) {
+          this.messageStore.saveMMORPGEntity("guilds", id, guild);
+        }
+        for (const [id, party] of Object.entries(migrated.parties)) {
+          this.messageStore.saveMMORPGEntity("parties", id, party);
+        }
+        for (const [id, proposal] of Object.entries(migrated.marriageProposals)) {
+          this.messageStore.saveMMORPGEntity("marriageProposals", id, proposal);
+        }
+        for (const [id, listing] of Object.entries(migrated.marketListings)) {
+          this.messageStore.saveMMORPGEntity("marketListings", id, listing);
+        }
+        for (const [id, mail] of Object.entries(migrated.mails)) {
+          this.messageStore.saveMMORPGEntity("mails", id, mail);
+        }
+        this.messageStore.saveMMORPGWorld(migrated.world);
+
+        fs.renameSync(jsonPath, jsonPath + ".archived");
+        console.log("[MMORPG] mmorpg-state.json archived as .archived");
+
+        return migrated;
+      } catch (error) {
+        console.error("[MMORPG] Failed to migrate mmorpg-state.json:", error);
+      }
+    }
+
+    // Load from SQLite
+    return this.loadFromSQLite();
+  }
+
+  private loadFromSQLite(): MMORPGState {
     try {
-      if (!fs.existsSync(this.filePath)) {
+      const players = this.messageStore.getAllMMORPGEntities("players") as Record<string, PlayerState>;
+      const guilds = this.messageStore.getAllMMORPGEntities("guilds") as Record<string, GuildState>;
+      const parties = this.messageStore.getAllMMORPGEntities("parties") as Record<string, PartyState>;
+      const marriageProposals = this.messageStore.getAllMMORPGEntities("marriageProposals") as Record<string, MarriageProposalState>;
+      const marketListings = this.messageStore.getAllMMORPGEntities("marketListings") as Record<string, MarketListing>;
+      const mails = this.messageStore.getAllMMORPGEntities("mails") as Record<string, MailState>;
+      const worldRaw = this.messageStore.getMMORPGWorld() as WorldState | null;
+
+      const hasData = Object.keys(players).length > 0
+        || Object.keys(guilds).length > 0
+        || Object.keys(parties).length > 0
+        || Object.keys(marriageProposals).length > 0
+        || Object.keys(marketListings).length > 0
+        || Object.keys(mails).length > 0
+        || worldRaw !== null;
+
+      if (!hasData) {
         return this.createEmptyState();
       }
-      return normalizeState(JSON.parse(fs.readFileSync(this.filePath, "utf-8")) as Partial<MMORPGState>);
+
+      return normalizeState({
+        players,
+        guilds,
+        parties,
+        marriageProposals,
+        marketListings,
+        mails,
+        world: worldRaw ?? undefined,
+      });
     } catch (error) {
-      console.error("[MMORPG] 读取状态失败，使用空状态:", error);
+      console.error("[MMORPG] Failed to load state from SQLite, using empty state:", error);
       return this.createEmptyState();
     }
   }
@@ -404,8 +517,45 @@ export class MMORPGStateStore {
   }
 
   private persistNow() {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2), "utf-8");
+    try {
+      // Process deletions first
+      for (const key of this.deletedEntities) {
+        const colonIdx = key.indexOf(":");
+        const category = key.slice(0, colonIdx);
+        const entityId = key.slice(colonIdx + 1);
+        this.messageStore.deleteMMORPGEntity(category, entityId);
+      }
+      this.deletedEntities.clear();
+
+      // Save all entities in dirty categories
+      for (const category of this.dirtyCategories) {
+        const entities = this.getCategoryEntities(category);
+        for (const [entityId, data] of Object.entries(entities)) {
+          this.messageStore.saveMMORPGEntity(category, entityId, data);
+        }
+      }
+      this.dirtyCategories.clear();
+
+      // Save world if dirty
+      if (this.worldDirty) {
+        this.messageStore.saveMMORPGWorld(this.state.world);
+        this.worldDirty = false;
+      }
+    } catch (error) {
+      console.error("[MMORPG] Failed to persist state to SQLite:", error);
+    }
+  }
+
+  private getCategoryEntities(category: string): Record<string, unknown> {
+    switch (category) {
+      case "players": return this.state.players;
+      case "guilds": return this.state.guilds;
+      case "parties": return this.state.parties;
+      case "marriageProposals": return this.state.marriageProposals;
+      case "marketListings": return this.state.marketListings;
+      case "mails": return this.state.mails;
+      default: return {};
+    }
   }
 }
 

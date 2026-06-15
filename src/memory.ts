@@ -1,8 +1,7 @@
-import { Memory } from "mem0ai/oss";
 import fs from "node:fs";
 import path from "node:path";
-import type { MemoryConfig, BotMessage, LLMConfig } from "./types.js";
-import type { ConversationScope, MessageStore } from "./message-store.js";
+import type { MemoryConfig, BotMessage } from "./types.js";
+import type { ConversationScope, ExtractedMemory, MessageStore } from "./message-store.js";
 
 export type MemoryMessage = {
   role: "user" | "assistant" | "system";
@@ -11,23 +10,15 @@ export type MemoryMessage = {
 
 type CompressCallback = (history: MemoryMessage[]) => Promise<string>;
 
-type PersistedConversationHistory = {
-  version: 1;
-  conversations: Record<string, MemoryMessage[]>;
-};
-
 export class MemoryManager {
-  private mem0?: Memory;
   private conversationHistory = new Map<string, MemoryMessage[]>();
   private config: MemoryConfig;
   private compressCallback?: CompressCallback;
-  private readonly snapshotPath: string;
   private saveTimer: NodeJS.Timeout | null = null;
   private hydratedKeys = new Set<string>();
 
   constructor(config: MemoryConfig, private readonly messageStore?: MessageStore) {
     this.config = config;
-    this.snapshotPath = path.resolve(process.cwd(), "data", "conversation-history.json");
     this.loadPersistedConversationHistory();
   }
 
@@ -41,90 +32,63 @@ export class MemoryManager {
   }
 
   private loadPersistedConversationHistory() {
-    try {
-      if (!fs.existsSync(this.snapshotPath)) {
-        return;
+    if (!this.messageStore) return;
+
+    // Auto-migrate from legacy JSON file if it exists and SQLite is empty
+    const jsonPath = path.resolve(process.cwd(), "data", "conversation-history.json");
+    if (fs.existsSync(jsonPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(jsonPath, "utf-8")) as { conversations?: Record<string, MemoryMessage[]> };
+        const conversations = raw.conversations ?? {};
+        const keys = Object.keys(conversations);
+        if (keys.length > 0) {
+          console.log(`[Memory] 检测到旧版 conversation-history.json（${keys.length} 个会话），开始迁移至 SQLite…`);
+          for (const [scope, history] of Object.entries(conversations)) {
+            const normalized = normalizeHistory(history);
+            if (normalized.length > 0) {
+              this.messageStore.saveConversationSnapshot(scope, normalized);
+            }
+          }
+          console.log("[Memory] conversation-history.json 迁移完成");
+        }
+        fs.renameSync(jsonPath, jsonPath + ".archived");
+        console.log("[Memory] conversation-history.json 已归档为 .archived");
+      } catch (error) {
+        console.error("[Memory] 迁移 conversation-history.json 失败:", error);
       }
-      const raw = JSON.parse(fs.readFileSync(this.snapshotPath, "utf-8")) as Partial<PersistedConversationHistory>;
-      const conversations = raw.conversations ?? {};
-      for (const [key, history] of Object.entries(conversations)) {
-        const normalized = normalizeHistory(history);
+    }
+
+    // Load from SQLite
+    try {
+      const snapshots = this.messageStore.getAllConversationSnapshots();
+      for (const [scope, messages] of snapshots) {
+        const normalized = normalizeHistory(messages as MemoryMessage[]);
         if (normalized.length > 0) {
-          this.conversationHistory.set(key, normalized);
-          this.hydratedKeys.add(key);
+          this.conversationHistory.set(scope, normalized);
         }
       }
     } catch (error) {
-      console.error("[Memory] 读取本地会话快照失败:", error);
+      console.error("[Memory] 从 SQLite 加载会话快照失败:", error);
     }
   }
 
   private persistConversationHistorySoon() {
+    if (!this.messageStore) return;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
       try {
-        const dir = path.dirname(this.snapshotPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
+        for (const [scope, messages] of this.conversationHistory) {
+          this.messageStore!.saveConversationSnapshot(scope, messages);
         }
-        const payload: PersistedConversationHistory = {
-          version: 1,
-          conversations: Object.fromEntries(this.conversationHistory.entries()),
-        };
-        fs.writeFileSync(this.snapshotPath, JSON.stringify(payload, null, 2), "utf-8");
       } catch (error) {
-        console.error("[Memory] 保存本地会话快照失败:", error);
+        console.error("[Memory] 保存会话快照至 SQLite 失败:", error);
       }
     }, 200);
   }
 
-  async init(llmConfig?: LLMConfig) {
+  async init() {
     if (!this.config.enabled) return;
-
-    if (this.config.provider === "mem0") {
-      const mem0Config: Record<string, unknown> = {};
-
-      // 配置 Embedder - Google AI Studio OpenAI 兼容接口
-      const embedderConfig: Record<string, string | number> = {
-        apiKey: this.config.mem0ApiKey,
-        model: this.config.mem0EmbeddingModel || "models/gemini-embedding-001",
-      };
-      if (this.config.mem0BaseUrl) {
-        embedderConfig.baseURL = this.config.mem0BaseUrl;
-      }
-      mem0Config.embedder = { provider: "openai", config: embedderConfig };
-
-      // 配置 LLM 提取（使用聊天的 DeepSeek API）
-      if (llmConfig) {
-        const llmInnerConfig: Record<string, unknown> = {
-          apiKey: llmConfig.apiKey,
-          model: llmConfig.model,
-        };
-        if (llmConfig.baseUrl) {
-          llmInnerConfig.baseURL = llmConfig.baseUrl;
-        }
-        mem0Config.llm = { provider: "openai", config: llmInnerConfig };
-      }
-
-      // 禁用 SQLite history store（避免 better-sqlite3 原生模块问题）
-      mem0Config.disableHistory = true;
-
-      // 配置 vectorStore 维度及持久化路径
-      const dimension = this.config.mem0EmbeddingDimension;
-      const vectorStoreConfig: Record<string, unknown> = {
-        collectionName: "memories",
-        dbPath: path.resolve(process.cwd(), "data", "vector_store.db"),
-      };
-      if (dimension) {
-        vectorStoreConfig.dimension = dimension;
-      }
-      mem0Config.vectorStore = { provider: "memory", config: vectorStoreConfig };
-
-      this.mem0 = new Memory(mem0Config);
-      console.log("[Memory] mem0 已初始化");
-    } else {
-      console.log("[Memory] 使用简易内存模式（无持久化）");
-    }
+    console.log("[Memory] 使用 SQLite + 本地快照作为记忆源");
   }
 
   private getHistoryKey(message: BotMessage): string {
@@ -138,16 +102,21 @@ export class MemoryManager {
       return;
     }
 
-    const existing = this.conversationHistory.get(key);
-    if (existing && existing.length > 0) {
-      this.hydratedKeys.add(key);
-      return;
-    }
-
+    // 从 SQLite 重建完整对话轮次（权威数据源）
     const restored = this.rebuildConversationFromStore(message);
-    if (restored.length > 0) {
+
+    // 保留 JSON 快照中的 system 摘要（SQLite 不存储这些）
+    const existing = this.conversationHistory.get(key);
+    const summaries = existing?.filter((m) => m.role === "system") ?? [];
+
+    if (summaries.length > 0 && restored.length > 0) {
+      // 摘要 + SQLite 完整轮次合并
+      this.conversationHistory.set(key, [...summaries, ...restored]);
+    } else if (restored.length > 0) {
       this.conversationHistory.set(key, restored);
     }
+    // 如果 SQLite 也没有数据，保留 JSON 原样（可能是新 scope 或空 scope）
+
     this.hydratedKeys.add(key);
   }
 
@@ -175,18 +144,52 @@ export class MemoryManager {
   }
 
   async getRelevantMemories(message: BotMessage): Promise<string[]> {
-    if (!this.config.enabled || !this.mem0) return [];
+    if (!this.messageStore || !message.userId) return [];
 
     try {
-      const userId = message.userId || "unknown";
-      const results = await this.mem0.search(message.text, {
-        filters: { user_id: userId },
-      });
-      return results.results.map((m: { memory: string }) => m.memory);
-    } catch (error) {
-      const err = error as { status?: number; message?: string; error?: { message?: string } };
-      console.error("[Memory] 搜索记忆失败:", err.status ? `HTTP ${err.status}` : "", err.message || err.error?.message || error);
+      const allFacts = this.messageStore.getAllUserFacts(message.userId);
+      if (allFacts.length === 0) return [];
+
+      const messageTokens = tokenize(message.text);
+      if (messageTokens.length === 0) return [];
+
+      const now = Date.now();
+      const scored = allFacts.map((mem) => ({
+        id: mem.id,
+        content: mem.content,
+        score: computeFactScore(mem, messageTokens, now),
+      }));
+
+      scored.sort((a, b) => b.score - a.score);
+      const topN = scored.filter((s) => s.score > 0).slice(0, 5);
+
+      if (topN.length > 0) {
+        const accessedIds = topN.map((s) => s.id);
+        this.messageStore.bumpFactAccess(accessedIds);
+      }
+
+      return topN.map((s) => s.content);
+    } catch {
       return [];
+    }
+  }
+
+  /** Save inline-extracted facts with substring deduplication. */
+  async saveExtractedFacts(userId: string, facts: string[]): Promise<void> {
+    if (!this.messageStore || facts.length === 0) return;
+
+    const existing = this.messageStore.getAllUserFacts(userId);
+    const existingTexts = existing.map((m) => m.content);
+
+    for (const fact of facts) {
+      if (!isDuplicateFact(fact, existingTexts)) {
+        this.messageStore.insertExtractedMemory({
+          userId,
+          content: fact,
+          type: "extracted_fact",
+          attributedTo: "inline_extractor",
+        });
+      }
     }
   }
 
@@ -201,34 +204,32 @@ export class MemoryManager {
 
     this.conversationHistory.set(key, history);
     this.persistConversationHistorySoon();
-
-    // 异步存储到 mem0
-    if (this.config.enabled && this.mem0 && message.userId) {
-      try {
-        await this.mem0.add(
-          [
-            { role: "user", content: message.text },
-            { role: "assistant", content: response },
-          ],
-          { userId: message.userId }
-        );
-      } catch (error) {
-        console.error("[Memory] 存储记忆失败:", error);
-      }
-    }
   }
 
   getConversationHistory(message: BotMessage): MemoryMessage[] {
     this.ensureConversationHydrated(message);
     const key = this.getHistoryKey(message);
-    return this.conversationHistory.get(key) || [];
+    const history = this.conversationHistory.get(key) || [];
+
+    // 只返回最近若干条，不全量恢复
+    const limit = this.config.maxHistoryLength * 2;
+    if (history.length <= limit) return history;
+
+    // 保留摘要（如果在头部）+ 最近的条目
+    const hasSummary = history[0]?.role === "system";
+    if (hasSummary) {
+      return [history[0], ...history.slice(-limit)];
+    }
+    return history.slice(-limit);
   }
 
   clearHistory(message: BotMessage) {
     const key = this.getHistoryKey(message);
     this.conversationHistory.delete(key);
     this.hydratedKeys.delete(key);
-    this.persistConversationHistorySoon();
+    if (this.messageStore) {
+      this.messageStore.deleteConversationSnapshot(key);
+    }
   }
 
   async addBatch(messages: BotMessage[], response: string) {
@@ -245,21 +246,6 @@ export class MemoryManager {
 
     this.conversationHistory.set(key, history);
     this.persistConversationHistorySoon();
-
-    if (this.config.enabled && this.mem0 && primary.userId) {
-      const lastMsg = messages[messages.length - 1];
-      try {
-        await this.mem0.add(
-          [
-            { role: "user", content: lastMsg.text },
-            { role: "assistant", content: response },
-          ],
-          { userId: primary.userId }
-        );
-      } catch (error) {
-        console.error("[Memory] 批量存储记忆失败:", error);
-      }
-    }
   }
 
   private async compactHistory(history: MemoryMessage[]) {
@@ -295,19 +281,6 @@ export class MemoryManager {
   }
 }
 
-function normalizeHistory(history: MemoryMessage[] | undefined): MemoryMessage[] {
-  if (!Array.isArray(history)) {
-    return [];
-  }
-  const filtered = history.filter((item): item is MemoryMessage => (
-    Boolean(item)
-    && (item.role === "user" || item.role === "assistant" || item.role === "system")
-    && typeof item.content === "string"
-    && item.content.length > 0
-  ));
-  return coalesceUserChunks(filtered);
-}
-
 function appendConversationTurn(history: MemoryMessage[], userContent: string, assistantContent: string) {
   if (userContent.trim()) {
     if (history[history.length - 1]?.role === "user") {
@@ -336,6 +309,19 @@ function formatConversationChunk(messages: BotMessage[]): string {
   }).join("\n");
 }
 
+function normalizeHistory(history: MemoryMessage[] | undefined): MemoryMessage[] {
+  if (!Array.isArray(history)) {
+    return [];
+  }
+  const filtered = history.filter((item): item is MemoryMessage => (
+    Boolean(item)
+    && (item.role === "user" || item.role === "assistant" || item.role === "system")
+    && typeof item.content === "string"
+    && item.content.length > 0
+  ));
+  return coalesceUserChunks(filtered);
+}
+
 function coalesceUserChunks(history: MemoryMessage[]): MemoryMessage[] {
   const result: MemoryMessage[] = [];
 
@@ -349,4 +335,66 @@ function coalesceUserChunks(history: MemoryMessage[]): MemoryMessage[] {
   }
 
   return result;
+}
+
+// ── Fact retrieval helpers ──────────────────────────────────────────────
+
+/** Chinese-aware tokenizer: split on punctuation/spaces, filter stop words and short tokens. */
+const STOP_WORDS = new Set([
+  "的", "了", "在", "是", "我", "你", "他", "她", "它", "们",
+  "这", "那", "有", "和", "与", "或", "不", "也", "都", "就",
+  "会", "要", "能", "可以", "可", "把", "被", "让", "给", "从",
+  "对", "向", "用", "着", "过", "吗", "呢", "吧", "啊", "嗯",
+  "the", "a", "an", "is", "are", "was", "were", "be", "been",
+  "in", "on", "at", "to", "for", "of", "and", "or", "but",
+  "it", "he", "she", "we", "they", "this", "that", "do", "does",
+]);
+
+function tokenize(text: string): string[] {
+  const raw = text
+    .split(/[\s,.;:!?，。；：！？、\n\r\t()[\]{}""''「」『』【】《》<>@#$%^&*+=~`|\\/]+/)
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length >= 2 && !STOP_WORDS.has(t));
+  return [...new Set(raw)]; // deduplicate tokens
+}
+
+/**
+ * Score a fact against the current message using keyword overlap, recency, and access frequency.
+ * Pure local computation — no LLM calls.
+ */
+function computeFactScore(fact: ExtractedMemory, messageTokens: string[], now: number): number {
+  const factTokens = tokenize(fact.content);
+  if (factTokens.length === 0) return 0;
+
+  // Keyword overlap: how many fact tokens appear in the message
+  const messageTokenSet = new Set(messageTokens);
+  let overlap = 0;
+  for (const token of factTokens) {
+    if (messageTokenSet.has(token)) overlap++;
+  }
+  if (overlap === 0) return 0; // No keyword match at all → irrelevant
+
+  const keywordScore = overlap * 3;
+
+  // Recency: newer facts score higher (decay over 30 days)
+  const updatedAt = fact.imported_at; // fallback to imported_at if updated_at is null
+  const ageMs = now - updatedAt;
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  const recencyScore = Math.max(0, 1 - ageMs / thirtyDaysMs);
+
+  // Access frequency: frequently accessed facts are more important
+  const accessScore = Math.min(fact.access_count, 10) * 0.5;
+
+  return keywordScore + recencyScore + accessScore;
+}
+
+/** Substring-based deduplication: skip if fact (>=6 chars) is a substring of an existing memory or vice versa. */
+function isDuplicateFact(fact: string, existingTexts: string[]): boolean {
+  const factLower = fact.toLowerCase();
+  for (const existing of existingTexts) {
+    const existLower = existing.toLowerCase();
+    if (factLower.length >= 6 && existLower.includes(factLower)) return true;
+    if (existLower.length >= 6 && factLower.includes(existLower)) return true;
+  }
+  return false;
 }
