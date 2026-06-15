@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+
+bot.config.json
+.env
+.env.local
+.env.*.local
+
+*.log
+*.bak
+*.tmp
+
+.DS_Store
+Thumbs.db

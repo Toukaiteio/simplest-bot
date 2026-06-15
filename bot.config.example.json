@@ -1,0 +1,131 @@
+{
+  "oneBot": {
+    "url": "ws://127.0.0.1:61111",
+    "accessToken": "",
+    "connectionTimeoutMs": 30000,
+    "reconnectIntervalMs": 5000,
+    "actionTimeoutMs": 10000
+  },
+  "llm": {
+    "provider": "openai",
+    "baseUrl": "",
+    "apiKey": "sk-your-api-key",
+    "model": "gpt-4o-mini",
+    "temperature": 0.7,
+    "maxTokens": 2048,
+    "systemPrompt": "你是一个友好的AI助手。请用中文回复，保持简洁。",
+    "reasoningEffort": "low",
+    "supportsImages": false,
+    "supportsVideo": false,
+    "supportsVoice": false
+  },
+  "memory": {
+    "enabled": true,
+    "provider": "mem0",
+    "mem0ApiKey": "",
+    "mem0BaseUrl": "",
+    "mem0EmbeddingModel": "",
+    "mem0EmbeddingDimension": 3072,
+    "maxHistoryLength": 20
+  },
+  "auth": {
+    "adminUserIds": ["123456789"]
+  },
+  "blacklist": {
+    "enabled": true,
+    "blockedUserIds": [],
+    "blockedGroupIds": []
+  },
+  "plugins": {
+    "blacklist": true,
+    "groupTrigger": true,
+    "reply": true,
+    "atMention": true,
+    "split": true,
+    "debounce": true,
+    "webfetch": false,
+    "search": true,
+    "browser": true,
+    "dailyReport": true,
+    "fileWorkspace": true,
+    "adminAssist": true,
+    "todo": true,
+    "mmorpgFramework": true
+  },
+  "contextManagement": {
+    "enabled": true,
+    "compressionThresholdTokens": 100000,
+    "maxModelContextTokens": 128000,
+    "outputReserveTokens": 4096,
+    "toolReserveTokens": 2048,
+    "chunkSegmentThresholdTokens": 8000,
+    "recentChunksToKeep": 5,
+    "tokenizer": "auto",
+    "maxMessageChars": 2000
+  },
+  "pluginSettings": {
+    "coreCommand": {
+      "prefix": "$"
+    },
+    "fileWorkspace": {
+      "rootDir": "data/chat-files",
+      "expirationDays": 10,
+      "maxViewChars": 4000
+    },
+    "dailyReport": {
+      "time": "00:00",
+      "sendToActiveGroups": true,
+      "topUsersLimit": 5
+    },
+    "groupTrigger": {
+      "enabled": true,
+      "requireMention": true,
+      "keywords": ["bot", "Bot"]
+    },
+    "adminAssist": {
+      "mentionTimeoutSeconds": 30,
+      "activityLookbackMinutes": 15,
+      "activitySampleIntervalSeconds": 15,
+      "awayIdleThresholdSeconds": 120,
+      "maxSummarySegments": 5
+    },
+    "todo": {
+      "dataFile": "data/todos.json",
+      "maxItemsPerChat": 100,
+      "schedulerLookaheadSeconds": 30,
+      "defaultReminderPrefix": "[待办提醒]"
+    },
+    "mmorpgFramework": {
+      "dataFile": "data/mmorpg-state.json",
+      "autoValidateOnLoad": true,
+      "defaultStartingClassId": "warrior",
+      "defaultStartingAreaId": "starter_village"
+    },
+    "search": {
+      "defaultProvider": "default",
+      "maxResultChars": 5000,
+      "providers": [
+        {
+          "name": "default",
+          "baseUrl": "https://api.openai.com/v1",
+          "apiKey": "",
+          "model": "gpt-4o",
+          "systemPrompt": "你是一个网络搜索助手。当用户提出问题时，你会进行网络搜索并返回准确、简洁的答案。请注明信息来源。"
+        }
+      ]
+    },
+    "browser": {
+      "host": "127.0.0.1",
+      "port": 9222,
+      "connectTimeoutMs": 10000,
+      "navigationTimeoutMs": 30000,
+      "maxAgentSteps": 20,
+      "viewportWidth": 1280,
+      "viewportHeight": 720,
+      "screenshotFormat": "png",
+      "chromePath": "",
+      "headless": true,
+      "launchArgs": []
+    }
+  }
+}
