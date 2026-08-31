@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { BotToolRegistration } from "./tooling.js";
+import type { Browser, Page } from "puppeteer-core";
+import type { LLMClient } from "./llm.js";
 
 // ==================== OneBot v11 类型 ====================
 
@@ -50,6 +52,7 @@ export const oneBotConfigSchema = z.object({
 });
 
 export const llmConfigSchema = z.object({
+  name: z.string().optional(),
   provider: z.enum(["openai", "deepseek", "ollama", "custom"]).default("openai"),
   baseUrl: z.string().url().optional(),
   apiKey: z.string().default(""),
@@ -61,6 +64,8 @@ export const llmConfigSchema = z.object({
   supportsImages: z.boolean().default(false),
   supportsVideo: z.boolean().default(false),
   supportsVoice: z.boolean().default(false),
+  /** 模型上下文窗口大小（token）。用于计算压缩阈值，不同模型可配不同值 */
+  contextWindow: z.number().int().positive().default(128000),
 });
 
 export const memoryConfigSchema = z.object({
@@ -87,6 +92,8 @@ export const pluginsConfigSchema = z.object({
   groupTrigger: z.boolean().default(true),
   reply: z.boolean().default(true),
   atMention: z.boolean().default(true),
+  markdownImage: z.boolean().default(true),
+  fftImage: z.boolean().default(true),
   split: z.boolean().default(true),
   debounce: z.boolean().default(true),
   webfetch: z.boolean().default(false),
@@ -97,12 +104,25 @@ export const pluginsConfigSchema = z.object({
   adminAssist: z.boolean().default(true),
   todo: z.boolean().default(true),
   mmorpgFramework: z.boolean().default(true),
+  moderation: z.boolean().default(false),
   chatSearch: z.boolean().default(true),
+  music: z.boolean().default(true),
+  flowmusic: z.boolean().default(false),
+  imgGen: z.boolean().default(true),
+  githubIssue: z.boolean().default(false),
+  farm: z.boolean().default(true),
+  agently: z.boolean().default(false),
+  neteaseMusic: z.boolean().default(true),
+  codingTools: z.boolean().default(false),
+  uno: z.boolean().default(true),
+  sgsCard: z.boolean().default(true),
 });
 
 export const contextManagementConfigSchema = z.object({
   enabled: z.boolean().default(true),
   compressionThresholdTokens: z.number().int().positive().default(100000),
+  maxToleranceTokens: z.number().int().positive().default(170000),
+  idleCompressionMinutes: z.number().int().positive().default(30),
   maxModelContextTokens: z.number().int().positive().default(128000),
   outputReserveTokens: z.number().int().positive().default(4096),
   toolReserveTokens: z.number().int().nonnegative().default(2048),
@@ -120,6 +140,7 @@ export const pluginSettingsSchema = z.object({
     time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).default("00:00"),
     sendToActiveGroups: z.boolean().default(true),
     topUsersLimit: z.number().int().min(3).max(10).default(5),
+    minLlmMessageThreshold: z.number().int().nonnegative().default(10),
   }).default({}),
   fileWorkspace: z.object({
     rootDir: z.string().default("data/chat-files"),
@@ -132,17 +153,32 @@ export const pluginSettingsSchema = z.object({
     keywords: z.array(z.string()).default(["bot", "Bot"]),
   }).default({}),
   adminAssist: z.object({
+    adminUserIds: z.array(z.coerce.string()).default([]),
     mentionTimeoutSeconds: z.number().int().min(3).max(300).default(30),
     activityLookbackMinutes: z.number().int().min(1).max(120).default(15),
     activitySampleIntervalSeconds: z.number().int().min(3).max(60).default(15),
     awayIdleThresholdSeconds: z.number().int().min(30).max(1800).default(120),
     maxSummarySegments: z.number().int().min(1).max(10).default(5),
+    steamApiKey: z.string().default(""),
+    steamUserIds: z.record(z.string(), z.string()).default({}),
   }).default({}),
   todo: z.object({
     dataFile: z.string().default("data/todos.json"),
     maxItemsPerChat: z.number().int().min(10).max(500).default(100),
     schedulerLookaheadSeconds: z.number().int().min(5).max(300).default(30),
     defaultReminderPrefix: z.string().min(1).default("[待办提醒]"),
+  }).default({}),
+  animeGuessr: z.object({
+    dataFile: z.string().default("data/anime-characters.json"),
+    contributionFile: z.string().default("data/anime-guessr-contributions.json"),
+    searchCacheFile: z.string().default("data/anime-guessr-search-cache.json"),
+    bangumiToken: z.string().default(""),
+    bangumiProxy: z.string().default(""),
+    backgroundCharactersPerWork: z.number().int().min(0).max(100).default(30),
+    searchCacheTtlDays: z.number().int().min(1).max(3650).default(90),
+    searchNegativeCacheTtlDays: z.number().int().min(1).max(365).default(7),
+    bangumiSearchMinIntervalMs: z.number().int().min(250).max(60000).default(1000),
+    bangumiSearchDailyLimit: z.number().int().min(1).max(100000).default(300),
   }).default({}),
   mmorpgFramework: z.object({
     dataFile: z.string().default("data/mmorpg-state.json"),
@@ -152,6 +188,22 @@ export const pluginSettingsSchema = z.object({
     imageApiBaseUrl: z.string().default(""),
     imageApiKey: z.string().default(""),
     imageApiModel: z.string().default("gpt-image-2"),
+    imageApiNewBaseUrl: z.string().default(""),
+    imageApiCookie: z.string().default(""),
+  }).default({}),
+  moderation: z.object({
+    apiKey: z.string().default(""),
+    baseUrl: z.string().url().default("https://api.openai.com/v1"),
+    model: z.string().default("omni-moderation-latest"),
+    timeoutMs: z.number().int().positive().default(10000),
+    blockFlagged: z.boolean().default(true),
+    replyOnBlocked: z.boolean().default(true),
+    ownerName: z.string().default("大妖精"),
+    replyMessage: z.string().default("对不起，{ownerName}禁止我对这类问题做出回答。"),
+    replySuffix: z.string().default("[消息已被系统拦截，simplest-bot默认会对所有输入进行审查，如有特殊需求请在设置中关闭]"),
+    categoryReplies: z.record(z.string(), z.string()).default({}),
+    failClosed: z.boolean().default(false),
+    logScores: z.boolean().default(true),
   }).default({}),
   search: z.object({
     providers: z.array(z.object({
@@ -184,18 +236,114 @@ export const pluginSettingsSchema = z.object({
     chromePath: z.string().default(""),
     headless: z.boolean().default(true),
     launchArgs: z.array(z.string()).default([]),
+    userDataDir: z.string().default(""),
+  }).default({}),
+  markdownImage: z.object({
+    outputDir: z.string().default("data/markdown-images"),
+    format: z.enum(["png", "webp"]).default("webp"),
+    quality: z.number().int().min(60).max(100).default(88),
+    cleanupDelayMs: z.number().int().positive().default(120000),
+  }).default({}),
+  fftImage: z.object({
+    outputDir: z.string().default("data/fft-images"),
+    cacheDir: z.string().default("data/fft-cache"),
+    maxTransformSize: z.number().int().min(64).max(1024).default(256),
+    renderScale: z.number().min(1).max(4).default(1.5),
+    resultCleanupDelayMs: z.number().int().positive().default(120000),
+    cacheRetentionHours: z.number().int().min(1).max(24 * 30).default(72),
+  }).default({}),
+  imgGen: z.object({
+    baseUrl: z.string().default(""),
+    apiKey: z.string().default(""),
+    model: z.string().default("gpt-image-2"),
+    newApiBaseUrl: z.string().default(""),
+    cookie: z.string().default(""),
+    legacyEditPath: z.string().default("/images/edits"),
+    newApiEditPath: z.string().default("/api-proxy/images/edits"),
+    synthIdRemoval: z.object({
+      enabled: z.boolean().default(false),
+      strength: z.enum(["gentle", "final", "nuke"]).default("final"),
+    }).default({}),
+    superResolution: z.object({
+      enabled: z.boolean().default(false),
+      model: z.enum(["realesrgan-x4plus-anime", "realesrgan-x4plus", "realesr-animevideov3-x4"]).default("realesrgan-x4plus-anime"),
+      scale: z.number().int().min(2).max(4).default(4),
+      denoise: z.number().int().min(0).max(3).default(0),
+      strategy: z.enum(["auto", "ai", "safe"]).default("auto"),
+      preserveTextAndLogo: z.boolean().default(true),
+      safeScale: z.number().int().min(2).max(4).default(2),
+    }).default({}),
+  }).default({}),
+  githubIssue: z.object({
+    token: z.string().default(""),
+  }).default({}),
+  sgsCard: z.object({
+    outputDir: z.string().default("data/sgs-card"),
+    commandPrefix: z.string().min(1).default("sgs"),
+    maxNicknameSimplifiedChars: z.number().int().positive().default(20),
+    maxBackstoryChars: z.number().int().positive().default(150),
+  }).default({}),
+  codingTools: z.object({
+    workspaceRoot: z.string().default("."),
+    maxFileBytes: z.number().int().positive().default(131072),
+    maxSearchResults: z.number().int().positive().default(1000),
+    maxLinesPerFile: z.number().int().positive().default(2000),
+    commandTimeoutMs: z.number().int().positive().default(30000),
   }).default({}),
 });
+
+export const personaConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** 数据目录（相对 cwd）。画像 JSON 存放于此。 */
+  dataDir: z.string().default("data"),
+  /** 进化循环间隔（小时）。软核心评估受 softCoreIntervalHours 进一步约束。 */
+  evolutionIntervalHours: z.number().positive().default(24),
+  /** 软核心评估间隔（小时）。比全局风格更慢。 */
+  softCoreIntervalHours: z.number().positive().default(24 * 7),
+  /** 进化评估窗口长度（小时），即回看多少小时的数据。 */
+  evaluationWindowHours: z.number().positive().default(24),
+  // ── 四道约束 ────────────────────────────────────────────────────────────
+  /** 软核心单字段单次微调最大幅度（绝对值）。 */
+  softCoreMaxAbsDelta: z.number().positive().default(0.03),
+  /** 软核心累积确认：连续多少次同向评估才生效。 */
+  softCoreRequiredConsecutive: z.number().int().min(1).default(3),
+  /** 软核心累计漂移预算上限（各字段 |Δ| 之和）。 */
+  softCoreDriftBudget: z.number().positive().default(0.3),
+  /** 全局风格单字段单次变化最大幅度（绝对值）。 */
+  globalStyleMaxAbsDelta: z.number().positive().default(0.15),
+  /** rapport 单字段偏移量硬上限（绝对值）。去偏闸①。 */
+  rapportMaxAbsOffset: z.number().positive().default(0.15),
+  // ── 去偏 cap ────────────────────────────────────────────────────────────
+  /** 单个用户对软核心进化的贡献上限（百分比，0-1）。去偏闸②。 */
+  singleUserInfluenceCap: z.number().min(0).max(1).default(0.2),
+  /** 收集的 AI 发言样本上限（条）。 */
+  maxBotSamples: z.number().int().positive().default(30),
+  /** 单条样本最大字符数。 */
+  maxBotSampleChars: z.number().int().positive().default(200),
+  // ── 防重复 / 防近义 / 容量与老化 ─────────────────────────────────────────
+  /** 数组字段（fillerWords/signatures/topicHints/knownMembers）近义去重阈值（0-1，相似度 ≥ 此值视为重复）。 */
+  dedupeSimilarityThreshold: z.number().min(0).max(1).default(0.85),
+  /** 最大保留 rapport 用户数。超过时按 updatedAt 淘汰最旧。 */
+  maxRapports: z.number().int().positive().default(200),
+  /** 最大保留群画像数。超过时按 updatedAt 淘汰最旧。 */
+  maxGroups: z.number().int().positive().default(50),
+  /** rapport 多少天未更新则触发老化衰减（偏移向 0 收缩）。0 表示不老化。 */
+  rapportStaleDays: z.number().min(0).default(90),
+  /** group 画像多少天未更新则触发老化清理。0 表示不老化。 */
+  groupStaleDays: z.number().min(0).default(180),
+}).default({});
 
 export const botConfigSchema = z.object({
   oneBot: oneBotConfigSchema,
   llm: llmConfigSchema,
+  llmFallbacks: z.array(llmConfigSchema).default([]),
   memory: memoryConfigSchema,
   auth: authConfigSchema,
   blacklist: blackListConfigSchema,
   plugins: pluginsConfigSchema,
   pluginSettings: pluginSettingsSchema.default({}),
   contextManagement: contextManagementConfigSchema.default({}),
+  persona: personaConfigSchema.default({}),
   messageTruncateThreshold: z.number().int().positive().default(2000),
 });
 
@@ -206,8 +354,19 @@ export type AuthConfig = z.infer<typeof authConfigSchema>;
 export type BlackListConfig = z.infer<typeof blackListConfigSchema>;
 export type PluginsConfig = z.infer<typeof pluginsConfigSchema>;
 export type ContextManagementConfig = z.infer<typeof contextManagementConfigSchema>;
+export type PersonaConfig = z.infer<typeof personaConfigSchema>;
 export type PluginSettings = z.infer<typeof pluginSettingsSchema>;
 export type BotConfig = z.infer<typeof botConfigSchema>;
+
+export type ProviderInfo = {
+  index: number;
+  name: string;
+  model: string;
+  provider: string;
+  baseUrl?: string;
+  healthy: boolean;
+  isActive: boolean;
+};
 
 // ==================== 插件系统类型 ====================
 
@@ -218,6 +377,12 @@ export type PluginContext = {
   sendVoice: (target: NotifyTarget, filePath: string) => Promise<void>;
   sendFile: (target: NotifyTarget, filePath: string, name?: string) => Promise<void>;
   replyText: (message: BotMessage, text: string) => Promise<void>;
+  recallMessage: (messageId: string) => Promise<void>;
+  getImageFilePath: (fileId: string) => Promise<string | null>;
+  getGroupNickname: (userId: string, groupId?: string) => Promise<string>;
+  getBrowser: () => Promise<Browser>;
+  newPage: () => Promise<Page>;
+  getUserFacts?: (userId: string) => Promise<string[]>;
 };
 
 export type PromptBuildInput =
@@ -265,10 +430,8 @@ export type GroupTriggerPlugin = Plugin & {
 // 防抖插件类型
 export type DebounceHandler = {
   shouldReplyCheck: (message: BotMessage) => Promise<boolean>;
-  chatBatch: (messages: BotMessage[]) => Promise<string>;
-  sendSegments: (target: NotifyTarget, segments: OneBotMessageSegment[]) => Promise<void>;
-  transformResponse: (text: string) => Promise<OneBotMessageSegment[] | null>;
-  splitResponse: (text: string) => Promise<string[] | null>;
+  chatBatch: (messages: BotMessage[], triggerIndex: number) => Promise<string>;
+  sendResponse: (target: NotifyTarget, text: string, context?: TransformContext) => Promise<void>;
 };
 
 export type DebouncePlugin = Plugin & {
@@ -297,11 +460,14 @@ export type CoreCommandOptions = {
 
 export type MenuCommandOptions = CoreCommandOptions & {
   hidden?: boolean;
+  group?: string;
+  aliases?: string[];
 };
 
 export type MenuCommandEntry = {
   name: string;
   description: string;
+  shortDescription?: string;
   adminOnly: boolean;
 };
 
@@ -380,6 +546,12 @@ export type CoreCommandPlugin = Plugin & {
   getPrefix(): string;
 };
 
+export type MenuCommandGroup = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
 export type MenuPlugin = Plugin & {
   registerCommand: (
     name: string,
@@ -387,9 +559,22 @@ export type MenuPlugin = Plugin & {
     handler: CoreCommandHandler,
     options?: MenuCommandOptions
   ) => void;
+  registerCommandGroup(id: string, label: string, description?: string): void;
   getCommands(): MenuCommandEntry[];
+  getGroups(): MenuCommandGroup[];
   getMenuText(): string;
   getPrefix(): string;
+};
+
+export type SgsCardPluginDeps = {
+  llm: LLMClient;
+  menu: MenuPlugin;
+  getUserFacts?: (userId: string) => Promise<string[]>;
+};
+
+export type InventorySubMenu = {
+  name: string;
+  getItems(userId: string): Array<{ itemId: string; name: string; quantity: number }>;
 };
 
 export type InventoryPlugin = Plugin & {
@@ -399,6 +584,24 @@ export type InventoryPlugin = Plugin & {
   hasItem(userId: string, itemId: string, quantity: number): boolean;
   getItemDef(itemId: string): ItemDef | undefined;
   getAllItemDefs(): ItemDef[];
+  registerSubMenu(menu: InventorySubMenu): void;
+  getSubMenus(): InventorySubMenu[];
+};
+
+export type ImgGenPlugin = Plugin & {
+  generateImageFile(
+    prompt: string,
+    outputDir: string,
+    fileName: string,
+    options?: { size?: string; quality?: string },
+  ): Promise<{ filePath: string; generatedAt: string }>;
+  editImageFile(
+    inputPath: string,
+    prompt: string,
+    outputDir: string,
+    fileName: string,
+    options?: { size?: string; quality?: string },
+  ): Promise<{ filePath: string; generatedAt: string }>;
 };
 
 export type SocialPlugin = Plugin & {

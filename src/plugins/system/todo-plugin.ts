@@ -89,6 +89,7 @@ export function createTodoPlugin(menuPlugin: MenuPlugin): TodoPlugin {
     ].join("\n"),
 
     async onLoad(ctx) {
+      menuPlugin.registerCommandGroup("todo", "待办事项", "创建、查看、管理待办提醒");
       ctxRef = ctx;
       tasks = loadTasks(ctx);
       scheduleAll();

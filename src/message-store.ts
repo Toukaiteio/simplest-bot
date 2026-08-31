@@ -33,6 +33,7 @@ export type QueryMessagesOptions = {
   endTime?: number;
   order?: "asc" | "desc";
   limit?: number;
+  offset?: number;
   includeReplies?: boolean;
 };
 
@@ -171,6 +172,13 @@ export class MessageStore {
       -- MMORPG world state
       CREATE TABLE IF NOT EXISTS mmorpg_world (
         id INTEGER PRIMARY KEY CHECK (id = 1),
+        data TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      -- ContextManager per-session state (working chunks, stable memory, segments)
+      CREATE TABLE IF NOT EXISTS context_states (
+        scope TEXT PRIMARY KEY,
         data TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -429,7 +437,8 @@ export class MessageStore {
 
   queryMessages(opts: QueryMessagesOptions): ChatMessageRecord[] {
     const includeReplies = opts.includeReplies !== false;
-    const limit = Math.min(opts.limit ?? 50, 200);
+    const limit = Math.min(opts.limit ?? 50, 1000);
+    const offset = Math.max(0, opts.offset ?? 0);
     const order = opts.order ?? "desc";
     const orderSql = order === "asc" ? "ASC" : "DESC";
 
@@ -475,8 +484,8 @@ export class MessageStore {
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-    const sql = `SELECT timestamp, user_id, group_id, msg_type, text, display_name, is_bot, message_id FROM messages ${whereClause} ORDER BY timestamp ${orderSql} LIMIT ?`;
-    params.push(limit);
+    const sql = `SELECT timestamp, user_id, group_id, msg_type, text, display_name, is_bot, message_id FROM messages ${whereClause} ORDER BY timestamp ${orderSql} LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as {
       timestamp: number;
@@ -601,8 +610,10 @@ export class MessageStore {
     endTime?: number;
     order?: "asc" | "desc";
     limit?: number;
+    offset?: number;
   } = {}): ChatMessageRecord[] {
-    const limit = Math.min(opts.limit ?? 50, 200);
+    const limit = Math.min(opts.limit ?? 50, 1000);
+    const offset = Math.max(0, opts.offset ?? 0);
     const orderSql = (opts.order ?? "desc") === "asc" ? "ASC" : "DESC";
 
     const conditions: string[] = [
@@ -624,8 +635,8 @@ export class MessageStore {
     }
 
     const whereClause = `WHERE ${conditions.join(" AND ")}`;
-    const sql = `SELECT timestamp, user_id, group_id, msg_type, text, display_name, is_bot, message_id FROM messages ${whereClause} ORDER BY timestamp ${orderSql} LIMIT ?`;
-    params.push(limit);
+    const sql = `SELECT timestamp, user_id, group_id, msg_type, text, display_name, is_bot, message_id FROM messages ${whereClause} ORDER BY timestamp ${orderSql} LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as {
       timestamp: number; user_id: string | null; group_id: string | null;
@@ -843,6 +854,34 @@ export class MessageStore {
       }
     }
     return map;
+  }
+
+  // ── ContextManager state persistence ────────────────────────────────────
+
+  saveContextState(scope: string, data: unknown): void {
+    this.db.prepare(`
+      INSERT INTO context_states (scope, data, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(scope) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
+    `).run(scope, JSON.stringify(data), Date.now());
+  }
+
+  getContextState(scope: string): unknown | null {
+    const row = this.db.prepare("SELECT data FROM context_states WHERE scope = ?").get(scope) as { data: string } | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.data);
+    } catch {
+      return null;
+    }
+  }
+
+  deleteContextState(scope: string): void {
+    this.db.prepare("DELETE FROM context_states WHERE scope = ?").run(scope);
+  }
+
+  getAllContextStateKeys(): string[] {
+    const rows = this.db.prepare("SELECT scope FROM context_states").all() as Array<{ scope: string }>;
+    return rows.map((r) => r.scope);
   }
 
   // ── User profiles ───────────────────────────────────────────────────────

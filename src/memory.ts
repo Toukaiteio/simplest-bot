@@ -154,7 +154,9 @@ export class MemoryManager {
       if (messageTokens.length === 0) return [];
 
       const now = Date.now();
-      const scored = allFacts.map((mem) => ({
+      const scored = allFacts
+        .filter((mem) => !isFactDormant(mem)) // 过滤掉不活跃的事实
+        .map((mem) => ({
         id: mem.id,
         content: mem.content,
         score: computeFactScore(mem, messageTokens, now),
@@ -230,6 +232,19 @@ export class MemoryManager {
     if (this.messageStore) {
       this.messageStore.deleteConversationSnapshot(key);
     }
+  }
+
+  /** 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应事实的访问计数 */
+  processFactMentions(response: string, userId: string): void {
+    if (this.messageStore) {
+      processFactMentions(response, userId, this.messageStore);
+    }
+  }
+
+  async getUserFacts(userId: string, limit = 20): Promise<string[]> {
+    if (!this.messageStore) return [];
+    const facts = this.messageStore.getAllUserFacts(userId);
+    return facts.slice(0, limit).map((f) => f.content);
   }
 
   async addBatch(messages: BotMessage[], response: string) {
@@ -388,7 +403,66 @@ function computeFactScore(fact: ExtractedMemory, messageTokens: string[], now: n
   return keywordScore + recencyScore + accessScore;
 }
 
-/** Substring-based deduplication: skip if fact (>=6 chars) is a substring of an existing memory or vice versa. */
+// ==================== 记忆淡忘系统 ====================
+
+/** 事实超过此天数未访问即进入不活跃状态 */
+const DORMANT_DAYS = 30;
+/** 访问次数低于此阈值 + 超过 DORMANT_DAYS 未访问 = 不活跃 */
+const DORMANT_ACCESS_THRESHOLD = 5;
+
+/** 判断一条事实是否处于不活跃状态（不活跃 = 不会主动注入但可被查询） */
+function isFactDormant(fact: ExtractedMemory): boolean {
+  if (fact.access_count >= DORMANT_ACCESS_THRESHOLD) return false;
+  const lastAccess = fact.last_accessed_at ?? fact.imported_at;
+  const ageMs = Date.now() - lastAccess;
+  return ageMs > DORMANT_DAYS * 24 * 60 * 60 * 1000;
+}
+
+/** 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应的事实（通过 MemoryManager 调用） */
+export function processFactMentions(response: string, userId: string, messageStore: MessageStore): void {
+  const regex = /\[FACT:([^\]]+?)\]/g;
+  let match: RegExpExecArray | null;
+  const mentionedTexts: string[] = [];
+  while ((match = regex.exec(response)) !== null) {
+    const text = match[1].trim();
+    if (text) mentionedTexts.push(text);
+  }
+  if (mentionedTexts.length === 0 || !messageStore) return;
+
+  // 查找匹配的事实并 bump
+  const allFacts = messageStore.getAllUserFacts(userId);
+  const toBump: number[] = [];
+  for (const fact of allFacts) {
+    for (const mentioned of mentionedTexts) {
+      if (fact.content.includes(mentioned) || mentioned.includes(fact.content)) {
+        toBump.push(fact.id);
+        break;
+      }
+    }
+  }
+  if (toBump.length > 0) {
+    messageStore.bumpFactAccess(toBump);
+  }
+}
+
+/** 查询用户事实（包括不活跃的），用于 AI 的直接查询工具 */
+export function queryUserFacts(
+  userId: string,
+  query: string,
+  messageStore: MessageStore,
+): Array<{ content: string; active: boolean; accessCount: number; lastAccess: number | null }> {
+  const allFacts = messageStore.getAllUserFacts(userId);
+  const queryLower = query.toLowerCase();
+  const results = allFacts
+    .filter(f => f.content.toLowerCase().includes(queryLower))
+    .map(f => ({
+      content: f.content,
+      active: !isFactDormant(f),
+      accessCount: f.access_count,
+      lastAccess: f.last_accessed_at ?? f.imported_at,
+    }));
+  return results;
+}
 function isDuplicateFact(fact: string, existingTexts: string[]): boolean {
   const factLower = fact.toLowerCase();
   for (const existing of existingTexts) {

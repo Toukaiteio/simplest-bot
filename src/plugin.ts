@@ -17,12 +17,18 @@ export class PluginManager {
     if (!this.ctx) throw new Error("PluginManager 未设置上下文");
 
     for (const plugin of this.plugins) {
-      try {
-        await plugin.onLoad?.(this.ctx);
-        console.log(`[Plugin] 已加载: ${plugin.name}`);
-      } catch (error) {
-        console.error(`[Plugin] 加载失败 ${plugin.name}:`, error);
-      }
+      await this.loadOne(plugin);
+    }
+  }
+
+  async loadOne(plugin: Plugin) {
+    if (!this.ctx) throw new Error("PluginManager 未设置上下文");
+
+    try {
+      await plugin.onLoad?.(this.ctx);
+      console.log(`[Plugin] 已加载: ${plugin.name}`);
+    } catch (error) {
+      console.error(`[Plugin] 加载失败 ${plugin.name}:`, error);
     }
   }
 

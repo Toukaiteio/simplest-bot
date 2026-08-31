@@ -1,6 +1,8 @@
-import type { InventoryPlugin, DataStorePlugin, ItemDef } from "../../types.js";
+import type { InventoryPlugin, DataStorePlugin, ItemDef, InventorySubMenu } from "../../types.js";
 
 export function createInventoryPlugin(store: DataStorePlugin): InventoryPlugin {
+  const subMenus: InventorySubMenu[] = [];
+
   return {
     name: "inventory",
     description: "用户物品栏系统",
@@ -35,6 +37,14 @@ export function createInventoryPlugin(store: DataStorePlugin): InventoryPlugin {
 
     getAllItemDefs(): ItemDef[] {
       return store.getAllItems();
+    },
+
+    registerSubMenu(menu: InventorySubMenu): void {
+      subMenus.push(menu);
+    },
+
+    getSubMenus(): InventorySubMenu[] {
+      return [...subMenus];
     },
   };
 }

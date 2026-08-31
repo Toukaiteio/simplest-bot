@@ -18,12 +18,21 @@ export function loadConfig(): BotConfig {
   const config = botConfigSchema.parse(raw);
 
   // 自动补全已安装插件的启用状态（默认 true）
-  const installedPlugins = ["blacklist", "groupTrigger", "reply", "atMention", "split", "debounce", "webfetch", "dailyReport", "fileWorkspace", "adminAssist", "todo", "mmorpgFramework", "chatSearch"];
+  const installedPlugins = ["blacklist", "groupTrigger", "reply", "atMention", "markdownImage", "fftImage", "split",
+    "debounce", "webfetch", "dailyReport", "fileWorkspace", "adminAssist",
+    "todo", "mmorpgFramework", "chatSearch", "music", "imgGen", "githubIssue", "farm", "uno", "sgsCard"];
   installedPlugins.forEach(name => {
     if (!(name in config.plugins)) {
       (config.plugins as Record<string, boolean>)[name] = true;
     }
   });
+
+  // 将补全后的配置回写磁盘，确保新增插件的默认配置项自动出现
+  const normalized = JSON.stringify(config, null, 2);
+  if (normalized !== JSON.stringify(raw, null, 2)) {
+    fs.writeFileSync(configPath, normalized + "\n", "utf8");
+    console.log("[Config] 配置文件已自动更新（新增默认配置项已写入）");
+  }
 
   return config;
 }

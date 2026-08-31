@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import type {
   BotMessage,
   DataStorePlugin,
@@ -8,11 +10,20 @@ import type {
 import type { BotToolRegistration } from "../../tooling.js";
 import { MessageStore } from "../../message-store.js";
 import { MMORPG_RULEBOOK, affinityToPercent, clampAffinity } from "../mmorpg/rulebook.js";
-import { makeTool } from "../mmorpg/framework/utils.js";
+import { makeTool, normalizeOptionalUserId } from "../mmorpg/framework/utils.js";
+import { screenshotHtml } from "../mmorpg/screenshot.js";
 
 // Minimal type to avoid heavy circular import — only the methods we call.
 interface OneBotLike {
   getGroupMemberList(groupId: string): Promise<Array<{ userId: string; nickname?: string; card?: string }>>;
+}
+type GroupMember = { userId: string; nickname?: string; card?: string };
+
+export function filterRelationsToCurrentGroup<T>(
+  relations: Iterable<[string, T]>,
+  members: ReadonlyMap<string, GroupMember> | null,
+): Array<[string, T]> {
+  return [...relations].filter(([userId]) => !members || members.has(userId));
 }
 
 const AT_USER_PATTERN = /@(\d+)/g;
@@ -33,6 +44,10 @@ const affinityToolParams = {
     reason: {
       type: "string",
       description: "调整原因（简短描述用户做了什么让你产生这个反应）",
+    },
+    user_id: {
+      type: "string",
+      description: "可选，目标用户QQ号。不填则默认为当前对话用户。",
     },
   },
   required: ["delta"],
@@ -76,10 +91,10 @@ export function createSocialPlugin(
   ): BotToolRegistration {
     return makeTool(name, description, affinityToolParams, async (args, input) => {
       const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
-      const userId = msg?.userId;
-      if (!userId) return "无法确定当前用户。";
+      const targetUserId = normalizeOptionalUserId(typeof args.user_id === "string" ? args.user_id : undefined) ?? msg?.userId;
+      if (!targetUserId) return "无法确定目标用户。";
 
-      if (isOnCooldown(userId)) {
+      if (isOnCooldown(targetUserId)) {
         return "好感度调整冷却中，暂时无法使用。";
       }
 
@@ -87,19 +102,19 @@ export function createSocialPlugin(
       const clamped = Math.max(-maxAbs, Math.min(maxAbs, rawDelta));
       if (clamped === 0) return "好感度变化为 0，无需调整。";
 
-      const mult = getAffinityMultiplier(userId);
+      const mult = getAffinityMultiplier(targetUserId);
       const effective = clamped > 0
         ? Math.round(clamped * mult)
         : Math.round(clamped / mult);
 
       const reason = typeof args.reason === "string" ? args.reason : "";
 
-      // Apply to user's AI affinity
-      const data = store.getUserData(userId);
+      // Apply to target user's AI affinity
+      const data = store.getUserData(targetUserId);
       data.affinity.ai = clampAffinity(data.affinity.ai + effective);
-      store.saveUserData(userId, data);
+      store.saveUserData(targetUserId, data);
 
-      setCooldown(userId, cooldownRounds);
+      setCooldown(targetUserId, cooldownRounds);
 
       const sign = effective > 0 ? "+" : "";
       return `好感度已调整 ${sign}${effective}（${reason || "无原因"}）。所有好感度工具进入 ${cooldownRounds} 轮冷却。`;
@@ -108,21 +123,21 @@ export function createSocialPlugin(
 
   const toolTiny = buildAffinityTool(
     "adjust_affinity_tiny",
-    `微调与当前用户的好感度（范围 ±${BEHAVIOR.toolTinyMax}）。用于对用户的日常言行做出轻微情感反应。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownTiny} 轮冷却。`,
+    `微调好感度（范围 ±${BEHAVIOR.toolTinyMax}）。可选参数 user_id 指定目标用户（不填则为当前对话用户）。用于对用户的日常言行做出轻微情感反应。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownTiny} 轮冷却。`,
     BEHAVIOR.toolTinyMax,
     BEHAVIOR.cooldownTiny,
   );
 
   const toolNormal = buildAffinityTool(
     "adjust_affinity_normal",
-    `中等幅度调整与当前用户的好感度（范围 ±${BEHAVIOR.toolNormalMax}）。用于对用户的显著行为（如暖心举动或冒犯言行）做出情感反应。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownNormal} 轮冷却。`,
+    `中等幅度调整好感度（范围 ±${BEHAVIOR.toolNormalMax}）。可选参数 user_id 指定目标用户（不填则为当前对话用户）。用于对用户的显著行为（如暖心举动或冒犯言行）做出情感反应。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownNormal} 轮冷却。`,
     BEHAVIOR.toolNormalMax,
     BEHAVIOR.cooldownNormal,
   );
 
   const toolMajor = buildAffinityTool(
     "adjust_affinity_major",
-    `大幅调整与当前用户的好感度（范围 ±${BEHAVIOR.toolMajorMax}）。仅在用户做出极其重大行为时使用（如深情告白或严重背叛）。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownMajor} 轮冷却。`,
+    `大幅调整好感度（范围 ±${BEHAVIOR.toolMajorMax}）。可选参数 user_id 指定目标用户（不填则为当前对话用户）。仅在用户做出极其重大行为时使用（如深情告白或严重背叛）。使用后会触发所有好感度工具 ${BEHAVIOR.cooldownMajor} 轮冷却。`,
     BEHAVIOR.toolMajorMax,
     BEHAVIOR.cooldownMajor,
   );
@@ -155,6 +170,18 @@ export function createSocialPlugin(
     return "陌生";
   }
 
+  async function requireCurrentGroupMembers(message: BotMessage): Promise<Map<string, GroupMember> | null> {
+    if (message.type !== "group" || !message.groupId) return null;
+    try {
+      const members = await onebot.getGroupMemberList(message.groupId);
+      if (!Array.isArray(members) || members.length === 0) throw new Error("群成员列表为空");
+      return new Map(members.filter((member) => member.userId).map((member) => [member.userId, member]));
+    } catch (error) {
+      console.warn(`[Social] 无法获取当前群 ${message.groupId} 的成员列表，已阻止关系数据输出:`, error);
+      return new Map();
+    }
+  }
+
   // ── Plugin definition ─────────────────────────────────────────────────────
   const plugin: SocialPlugin = {
     name: "social",
@@ -164,6 +191,7 @@ export function createSocialPlugin(
       "系统会为你提供当前对话用户的关系亲密度、行为风格建议和每日行为提示。",
       "请根据这些自然地调整你的语气、用词和互动方式，但不要直接报数字或提及'系统提示'。",
       "你有三个好感度调整工具（微小/普通/大幅），可以在对话中自然地使用它们来表达你对用户言行的好恶反应。",
+      "好感度工具可选填 user_id 参数来指定目标用户，不填则默认为当前对话用户。",
       "使用任意好感度工具后，所有好感度工具会进入冷却。请在关键时刻谨慎使用。",
     ].join("\n"),
 
@@ -379,10 +407,15 @@ export function createSocialPlugin(
         const profile = store.getUserData(message.userId);
         const summary = this.getInteractionSummary(message.userId);
         const mult = getAffinityMultiplier(message.userId);
-        const topRelations = Object.entries(profile.affinity.users)
+        const groupMembers = await requireCurrentGroupMembers(message);
+        if (groupMembers && groupMembers.size === 0) {
+          await ctx.replyText(message, "暂时无法验证当前群成员，为保护其他群成员隐私，本次不显示关系对象。请稍后重试。");
+          return;
+        }
+        const topRelations = filterRelationsToCurrentGroup(Object.entries(profile.affinity.users), groupMembers)
           .sort((a, b) => b[1] - a[1])
           .slice(0, 3)
-          .map(([uid, score]) => `${resolveUserLabel(uid, messageStore, message.groupId)}（${affinityToPercent(score)} / ${affinityLabel(score)}）`);
+          .map(([uid, score]) => `${resolveUserLabel(uid, messageStore, message.groupId, groupMembers?.get(uid))}（${affinityToPercent(score)} / ${affinityLabel(score)}）`);
 
         const lines = [
           "你的关系概览：",
@@ -399,7 +432,7 @@ export function createSocialPlugin(
       menuPlugin.registerCommand("affinity", `查看与 AI 或指定用户的关系：${menuPlugin.getPrefix()}affinity [ai|用户ID]`, async (message, args) => {
         if (!message.userId) return;
 
-        const target = (args[0] || "ai").toLowerCase();
+        const target = normalizeOptionalUserId(args[0]) ?? "ai";
         if (target === "ai") {
           const value = this.getAIAffinity(message.userId);
           const summary = this.getInteractionSummary(message.userId, "ai");
@@ -410,30 +443,40 @@ export function createSocialPlugin(
           );
           return;
         }
+        const groupMembers = await requireCurrentGroupMembers(message);
+        if (groupMembers && groupMembers.size === 0) {
+          await ctx.replyText(message, "暂时无法验证当前群成员，为保护其他群成员隐私，本次查询已拒绝。请稍后重试。");
+          return;
+        }
+        if (groupMembers && !groupMembers.has(target)) {
+          await ctx.replyText(message, "只能查询当前群成员的关系信息。");
+          return;
+        }
 
         const value = this.getUserAffinity(message.userId, target);
         const summary = this.getInteractionSummary(message.userId, target);
         await ctx.replyText(
           message,
-          `你与 ${resolveUserLabel(target, messageStore, message.groupId)} 的亲密度：${affinityToPercent(value)}（${affinityLabel(value)}）\n来源：送礼 ${summary.gifts}，@互动 ${summary.mentions}，回复互动 ${summary.replies}`,
+          `你与 ${resolveUserLabel(target, messageStore, message.groupId, groupMembers?.get(target))} 的亲密度：${affinityToPercent(value)}（${affinityLabel(value)}）\n来源：送礼 ${summary.gifts}，@互动 ${summary.mentions}，回复互动 ${summary.replies}`,
         );
       });
 
-      // ── $social-board — group-filtered leaderboard ─────────────────────
+      // ── $social-board — graphical leaderboard ──────────────────────────
       menuPlugin.registerCommand("social-board", "查看好感度排行榜（群聊中仅显示群内成员）", async (message) => {
         const allEntries = store.getAllUserEntries();
         let memberIds: Set<string> | null = null;
+        let groupMembers: Map<string, GroupMember> | null = null;
         let scopeLabel = "全局";
 
         // In group chats, fetch member list and filter
         if (message.type === "group" && message.groupId) {
-          try {
-            const members = await onebot.getGroupMemberList(message.groupId);
-            memberIds = new Set(members.map((m) => m.userId));
-            scopeLabel = "群内";
-          } catch {
-            // Fallback to global if API fails
+          groupMembers = await requireCurrentGroupMembers(message);
+          if (!groupMembers || groupMembers.size === 0) {
+            await ctx.replyText(message, "暂时无法验证当前群成员，为保护其他群成员隐私，本次不显示排行榜。请稍后重试。");
+            return;
           }
+          memberIds = new Set(groupMembers.keys());
+          scopeLabel = "群内";
         }
 
         const filteredEntries = memberIds
@@ -444,11 +487,12 @@ export function createSocialPlugin(
         const aiRanking = filteredEntries
           .sort((a, b) => b.profile.affinity.ai - a.profile.affinity.ai)
           .slice(0, 10)
-          .map((entry, index) => {
-            const label = resolveUserLabel(entry.userId, messageStore, message.groupId);
+          .map((entry) => {
+            const label = resolveUserLabel(entry.userId, messageStore, message.groupId, groupMembers?.get(entry.userId));
             const pct = affinityToPercent(entry.profile.affinity.ai);
             const tag = affinityLabel(entry.profile.affinity.ai);
-            return `  ${index + 1}. ${label} - ${pct}（${tag}）`;
+            const pctNum = Math.max(0, Math.min(100, Math.round((entry.profile.affinity.ai / MMORPG_RULEBOOK.social.maxAffinity) * 100)));
+            return { label, pct, tag, pctNum };
           });
 
         // Player-to-player affinity ranking (pairs only within group)
@@ -469,36 +513,35 @@ export function createSocialPlugin(
         const playerRanking = Array.from(pairMap.values())
           .sort((a, b) => b.total - a.total)
           .slice(0, 10)
-          .map((pair, index) => {
-            const nameA = resolveUserLabel(pair.a, messageStore, message.groupId);
-            const nameB = resolveUserLabel(pair.b, messageStore, message.groupId);
+          .map((pair) => {
+            const nameA = resolveUserLabel(pair.a, messageStore, message.groupId, groupMembers?.get(pair.a));
+            const nameB = resolveUserLabel(pair.b, messageStore, message.groupId, groupMembers?.get(pair.b));
             const pct = affinityToPercent(pair.total);
             const tag = affinityLabel(pair.total);
-            return `  ${index + 1}. ${nameA} ↔ ${nameB} - ${pct}（${tag}）`;
+            const pctNum = Math.max(0, Math.min(100, Math.round((pair.total / MMORPG_RULEBOOK.social.maxAffinity) * 100)));
+            return { nameA, nameB, pct, tag, pctNum };
           });
 
-        const lines: string[] = [];
-        if (aiRanking.length > 0) {
-          lines.push(`${scopeLabel} AI 好感度排行：`, ...aiRanking);
-        }
-        if (playerRanking.length > 0) {
-          if (lines.length > 0) lines.push("");
-          lines.push(`${scopeLabel} 玩家间亲密度排行：`, ...playerRanking);
-        }
-        if (lines.length === 0) {
-          lines.push("当前还没有可展示的关系排行。");
-        }
-        if (memberIds && message.groupId) {
-          lines.push(`\n（仅显示本群 ${memberIds.size} 位成员的数据）`);
-        }
+        const footer = memberIds && message.groupId
+          ? `仅显示本群 ${memberIds.size} 位成员的数据`
+          : undefined;
 
-        await ctx.replyText(message, lines.join("\n"));
+        const html = buildSocialBoardHtml(scopeLabel, aiRanking, playerRanking, footer);
+
+        const tmpDir = path.resolve("data/menu-images");
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const imagePath = path.join(tmpDir, `social-board-${Date.now()}.webp`);
+
+        await screenshotHtml(html, imagePath, { format: "webp", quality: 85 });
+
+        const target = message.type === "group"
+          ? { type: "group" as const, id: message.groupId! }
+          : { type: "private" as const, id: message.userId! };
+        await ctx.sendImage(target, imagePath);
+
+        fs.unlink(imagePath, () => {});
       });
 
-      // Keep old $social-top as alias
-      menuPlugin.registerCommand("social-top", "好感度排行榜（已迁移至 $social-board）", async (message) => {
-        await ctx.replyText(message, `此命令已更名为 ${menuPlugin.getPrefix()}social-board，请使用新命令。`);
-      });
     },
   };
 
@@ -519,8 +562,8 @@ function extractMentionedUsers(message: BotMessage): string[] {
   return Array.from(result);
 }
 
-function resolveUserLabel(userId: string, messageStore: MessageStore, groupId?: string): string {
-  return messageStore.getLatestKnownDisplayName(userId, groupId) ?? userId;
+function resolveUserLabel(userId: string, messageStore: MessageStore, groupId?: string, member?: GroupMember): string {
+  return member?.card || member?.nickname || messageStore.getLatestKnownDisplayName(userId, groupId) || userId;
 }
 
 function resolveReplyTargetUserId(message: BotMessage, messageStore: MessageStore): string | null {
@@ -558,4 +601,104 @@ function extractReplyMessageId(message: BotMessage): string | null {
   }
 
   return null;
+}
+
+// ── Social board HTML template ─────────────────────────────────────────────
+
+const SOCIAL_BOARD_CSS = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0f1117; font-family: "Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; }
+.sb { background: #0f1117; color: #c9d1d9; padding: 14px 16px; width: 380px; }
+.sb-hd { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; border-bottom: 2px solid #f78166; margin-bottom: 12px; }
+.sb-hd-icon { flex-shrink: 0; }
+.sb-title { font-size: 15px; font-weight: 700; color: #f78166; }
+.sb-section { margin-bottom: 12px; }
+.sb-sec-hd { display: flex; align-items: center; gap: 6px; padding: 4px 0; border-bottom: 1px solid #22272e; margin-bottom: 8px; }
+.sb-sec-title { font-size: 12px; font-weight: 700; color: #8b949e; }
+.sb-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+.sb-rank { width: 18px; font-size: 13px; font-weight: 700; text-align: center; flex-shrink: 0; }
+.sb-rank-1 { color: #e3b341; }
+.sb-rank-2 { color: #adbac7; }
+.sb-rank-3 { color: #db6d28; }
+.sb-name { font-size: 12px; color: #c9d1d9; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.sb-bar-wrap { width: 60px; flex-shrink: 0; }
+.sb-bar-bg { background: #22272e; border-radius: 3px; height: 6px; overflow: hidden; }
+.sb-bar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #f78166, #e3b341); }
+.sb-pct { font-size: 11px; color: #f78166; font-weight: 600; width: 32px; text-align: right; flex-shrink: 0; }
+.sb-tag { font-size: 9px; border-radius: 2px; padding: 1px 4px; flex-shrink: 0; white-space: nowrap; }
+.sb-empty { font-size: 12px; color: #484f58; padding: 8px 0; text-align: center; }
+.sb-ft { margin-top: 10px; padding-top: 6px; border-top: 1px solid #22272e; font-size: 10px; color: #484f58; text-align: center; }
+`;
+
+function esc(v: string): string {
+  return v.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function getRankClass(index: number): string {
+  if (index === 0) return "sb-rank sb-rank-1";
+  if (index === 1) return "sb-rank sb-rank-2";
+  if (index === 2) return "sb-rank sb-rank-3";
+  return "sb-rank";
+}
+
+function getTagStyle(label: string): string {
+  if (label === "灵魂伴侣" || label === "挚友") {
+    return "color: #e3b341; border: 1px solid #e3b341;";
+  }
+  if (label === "好友") {
+    return "color: #3fb950; border: 1px solid #3fb950;";
+  }
+  if (label === "熟悉") {
+    return "color: #58a6ff; border: 1px solid #58a6ff;";
+  }
+  return "color: #8b949e; border: 1px solid #8b949e;";
+}
+
+function buildSocialBoardHtml(
+  scopeLabel: string,
+  aiRanking: Array<{ label: string; pct: string; tag: string; pctNum: number }>,
+  playerRanking: Array<{ nameA: string; nameB: string; pct: string; tag: string; pctNum: number }>,
+  footer?: string,
+): string {
+  const heartIcon = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#f78166" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="sb-hd-icon"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>`;
+
+  const aiRows = aiRanking.length > 0
+    ? aiRanking.map((entry, i) => `
+      <div class="sb-row">
+        <span class="${getRankClass(i)}">${i + 1}</span>
+        <span class="sb-name">${esc(entry.label)}</span>
+        <span class="sb-bar-wrap"><span class="sb-bar-bg"><span class="sb-bar-fill" style="width:${entry.pctNum}%"></span></span></span>
+        <span class="sb-pct">${esc(entry.pct)}</span>
+        <span class="sb-tag" style="${getTagStyle(entry.tag)}">${esc(entry.tag)}</span>
+      </div>`).join("")
+    : `<div class="sb-empty">暂无数据</div>`;
+
+  const playerRows = playerRanking.length > 0
+    ? playerRanking.map((entry, i) => `
+      <div class="sb-row">
+        <span class="${getRankClass(i)}">${i + 1}</span>
+        <span class="sb-name">${esc(entry.nameA)} ↔ ${esc(entry.nameB)}</span>
+        <span class="sb-bar-wrap"><span class="sb-bar-bg"><span class="sb-bar-fill" style="width:${entry.pctNum}%"></span></span></span>
+        <span class="sb-pct">${esc(entry.pct)}</span>
+        <span class="sb-tag" style="${getTagStyle(entry.tag)}">${esc(entry.tag)}</span>
+      </div>`).join("")
+    : `<div class="sb-empty">暂无数据</div>`;
+
+  const footerHtml = footer ? `<div class="sb-ft">${esc(footer)}</div>` : "";
+
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>Social Board</title><style>${SOCIAL_BOARD_CSS}</style></head>
+<body>
+<div class="sb">
+<div class="sb-hd">${heartIcon}<span class="sb-title">${esc(scopeLabel)}好感度排行</span></div>
+<div class="sb-section">
+<div class="sb-sec-hd"><span class="sb-sec-title">AI 好感度</span></div>
+${aiRows}
+</div>
+<div class="sb-section">
+<div class="sb-sec-hd"><span class="sb-sec-title">玩家间亲密度</span></div>
+${playerRows}
+</div>
+${footerHtml}
+</div>
+</body></html>`;
 }

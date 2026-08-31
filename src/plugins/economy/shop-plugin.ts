@@ -7,8 +7,13 @@ import type {
   CheckinPlugin,
   SocialPlugin,
   MenuPlugin,
+  InventorySubMenu,
 } from "../../types.js";
 import { MMORPG_RULEBOOK } from "../mmorpg/rulebook.js";
+import { normalizeOptionalUserId } from "../mmorpg/framework/utils.js";
+import fs from "node:fs";
+import path from "node:path";
+import { screenshotHtml } from "../mmorpg/screenshot.js";
 
 function getTodayDateStr(): string {
   const d = new Date();
@@ -123,7 +128,7 @@ export function createShopPlugin(
           return;
         }
         const fromUserId = message.userId!;
-        const toUserId = args[0];
+        const toUserId = normalizeOptionalUserId(args[0]) ?? args[0];
         const itemId = args[1];
         const quantity = Math.max(1, parseInt(args[2], 10) || 1);
         const item = store.getItem(itemId);
@@ -152,17 +157,98 @@ export function createShopPlugin(
 
       menuPlugin.registerCommand("inventory", "查看我的物品栏", async (message: BotMessage) => {
         const userId = message.userId!;
+
+        // Economy items
         const inv = inventory.getInventory(userId);
-        const items = Object.entries(inv)
+        const ecoItems = Object.entries(inv)
           .map(([id, qty]) => {
             const def = inventory.getItemDef(id);
-            return `${def ? def.name : id} x${qty}`;
-          });
-        const text = items.length > 0
-          ? "🎒 你的物品栏：\n" + items.join("\n")
-          : "🎒 物品栏为空。";
-        await ctx.replyText(message, text);
+            return { name: def?.name ?? id, qty };
+          })
+          .sort((a, b) => b.qty - a.qty);
+
+        // Sub-menu items
+        const subMenus = inventory.getSubMenus();
+        const sections: Array<{ title: string; items: Array<{ name: string; qty: number }> }> = [];
+
+        if (ecoItems.length > 0) {
+          sections.push({ title: "通用背包", items: ecoItems });
+        }
+
+        for (const sub of subMenus) {
+          const items = sub.getItems(userId);
+          if (items.length > 0) {
+            sections.push({
+              title: sub.name,
+              items: items.map((i) => ({ name: i.name, qty: i.quantity })),
+            });
+          }
+        }
+
+        if (sections.length === 0) {
+          await ctx.replyText(message, "🧳 物品栏为空。");
+          return;
+        }
+
+        const html = buildInventoryHtml(sections);
+        const dir = path.resolve("data/inventory-images");
+        fs.mkdirSync(dir, { recursive: true });
+        const fp = path.join(dir, "inv-" + Date.now() + ".webp");
+        await screenshotHtml(html, fp, { width: 420, format: "webp", quality: 85 });
+
+        const target = message.type === "group"
+          ? { type: "group" as const, id: message.groupId! }
+          : { type: "private" as const, id: message.userId! };
+        await ctx.sendImage(target, fp);
+        fs.unlink(fp, () => {});
       });
     },
   };
+}
+
+// ── Inventory HTML card renderer ───────────────────────────────────────────
+
+function buildInventoryHtml(sections: Array<{ title: string; items: Array<{ name: string; qty: number }> }>): string {
+  const sectionHtml = sections.map((sec, si) => {
+    const isFirst = si === 0;
+    const itemsHtml = sec.items.slice(0, 30).map((item) => {
+      const name = escapeHtml(item.name);
+      return '<div class="inv-row"><span class="inv-name">' + name + '</span><span class="inv-qty">x' + item.qty + '</span></div>';
+    }).join("");
+    const overflow = sec.items.length > 30 ? '<div class="inv-more">...还有 ' + (sec.items.length - 30) + ' 件</div>' : "";
+    return (!isFirst ? '<div class="inv-div"></div>' : "") +
+      '<div class="inv-sec-title">' + escapeHtml(sec.title) + '</div>' +
+      '<div class="inv-items">' + itemsHtml + overflow + '</div>';
+  }).join("");
+
+  const bagIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8' +
+    'a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/>' +
+    '<line x1="12" y1="22.08" x2="12" y2="12"/></svg>';
+
+  return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8" /><style>' +
+    '*{box-sizing:border-box}html,body{margin:0;padding:0;background:#0f1117}body{' +
+    'padding:16px;font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif;' +
+    'color:#e6e9f2;font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}' +
+    '.sheet{width:388px;margin:0 auto;background:#161924;border:1px solid #2a3045;' +
+    'border-radius:14px;padding:16px 14px 14px}' +
+    '.hd{font-size:16px;font-weight:700;padding-bottom:10px;margin-bottom:10px;' +
+    'border-bottom:1px solid #2a3045;display:flex;align-items:center;gap:8px}' +
+    '.hd svg{width:16px;height:16px;color:#6ea8ff}' +
+    '.inv-div{height:1px;background:#232838;margin:8px 0}' +
+    '.inv-sec-title{font-size:12px;font-weight:600;color:#7a8095;margin-bottom:6px;letter-spacing:0.04em}' +
+    '.inv-items{display:flex;flex-direction:column;gap:1px}' +
+    '.inv-row{display:flex;justify-content:space-between;align-items:center;padding:5px 6px;border-radius:6px}' +
+    '.inv-row:hover{background:#1c2030}' +
+    '.inv-name{color:#e6e9f2;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+    '.inv-qty{color:#b8bcc9;font-size:12px;font-weight:600;font-family:"JetBrains Mono","Consolas",monospace;flex-shrink:0;margin-left:8px}' +
+    '.inv-more{color:#7a8095;font-size:11px;text-align:center;padding:4px 0}' +
+    '</style></head><body><div class="sheet">' +
+    '<div class="hd">' + bagIcon + '<span>物品栏</span></div>' +
+    sectionHtml +
+    '</div></body></html>';
+}
+
+function escapeHtml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }

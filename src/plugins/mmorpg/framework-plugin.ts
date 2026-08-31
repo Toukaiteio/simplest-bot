@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type {
   BotMessage,
   DataStorePlugin,
+  ImgGenPlugin,
   InventoryPlugin,
   ItemDef as StoreItemDef,
   MenuPlugin,
@@ -59,8 +60,7 @@ import {
   formatBattleLog,
   type BattleResult,
 } from "./battle-simulator.js";
-import { generateAndSaveImage, type ImageGenConfig } from "./image-gen-client.js";
-import { convertImageToWebp, closeBrowser, screenshotHtml } from "./screenshot.js";
+import { convertImageToWebp, screenshotHtml } from "./screenshot.js";
 import { resolveDialogueTree, buildDialogueMenu, applyDialogueEffects } from "./dialogue-engine.js";
 import {
   buildGuideMenu,
@@ -232,7 +232,8 @@ export function createMMORPGFrameworkPlugin(
   social: SocialPlugin,
   menuPlugin: MenuPlugin,
   messageStore: MessageStore,
-  welfare?: WelfareRewardSystemPlugin
+  welfare?: WelfareRewardSystemPlugin,
+  imgGenPlugin?: ImgGenPlugin,
 ): MMORPGFrameworkPlugin {
   let ctxRef: PluginContext | null = null;
   let stateStore: MMORPGStateStore | null = null;
@@ -242,9 +243,6 @@ export function createMMORPGFrameworkPlugin(
 
   // In-memory battle log storage (userId → last battle result)
   const battleLogStore = rt.battleLogStore;
-
-  // In-memory portrait generation rate limit (userId → last generation timestamp ms)
-  const portraitRateLimitMap = new Map<string, number>();
 
   // In-memory combat lock (userId → timestamp when the battle ends)
   // While the lock is active, the player cannot perform most actions.
@@ -287,6 +285,7 @@ export function createMMORPGFrameworkPlugin(
     ].join("\n"),
 
     async onLoad(ctx) {
+      menuPlugin.registerCommandGroup("mmo", "MMORPG 文字冒险", "角色、探索、战斗、装备、社交、公会");
       ctxRef = ctx;
       stateStore = new MMORPGStateStore(messageStore);
       validationReport = validateMMORPGContent(DEFAULT_MMORPG_CONTENT);
@@ -297,6 +296,23 @@ export function createMMORPGFrameworkPlugin(
       setRuntimeContext(ctx);
       setRuntimeStateStore(stateStore);
       setRuntimeValidationReport(validationReport);
+
+      // Register MMO inventory as an $inventory sub-menu
+      inventory.registerSubMenu({
+        name: "MMORPG 背包",
+        getItems(userId: string) {
+          const player = getExistingPlayer(userId);
+          if (!player) return [];
+          return player.inventory.map((entry) => {
+            const def = DEFAULT_MMORPG_CONTENT.items[entry.itemId];
+            return {
+              itemId: entry.itemId,
+              name: def?.name ?? entry.itemId,
+              quantity: entry.quantity,
+            };
+          });
+        },
+      });
 
       if (ctx.config.pluginSettings.mmorpgFramework.autoValidateOnLoad) {
         if (validationReport.errors.length > 0) {
@@ -1870,7 +1886,7 @@ ${menuBody}
           await replyCard(message as never, "发送邮件", `格式：${menuPlugin.getPrefix()}mmo-mail-send <userId> [itemId quantity] <标题> [正文...]`);
           return;
         }
-        const targetUserId = args[0]!.trim();
+        const targetUserId = normalizeOptionalUserId(args[0]!)!;
 
         let titleIndex = 1;
         let attachments: InventoryEntry[] = [];
@@ -2019,7 +2035,7 @@ ${menuBody}
         const guild = stateStore!.getGuild(player.guildId);
         if (!guild) throw new Error("公会不存在。");
         if (guild.leaderUserId !== player.userId) throw new Error("只有会长可以踢人。");
-        const targetUserId = args[0]?.trim();
+        const targetUserId = normalizeOptionalUserId(args[0]);
         if (!targetUserId) throw new Error("请输入要踢出的用户ID。");
         if (targetUserId === player.userId) throw new Error("不能踢出自己。");
         if (!guild.memberUserIds.includes(targetUserId)) throw new Error("该成员不在公会中。");
@@ -2277,9 +2293,8 @@ ${menuBody}
           return;
         }
 
-        const fwConfig = ctx.config.pluginSettings.mmorpgFramework;
-        if (!fwConfig.imageApiBaseUrl || !fwConfig.imageApiKey) {
-          await replyCard(message as never, "立绘", "立绘生成功能尚未配置。请联系管理员设置 imageApiBaseUrl 和 imageApiKey。");
+        if (!imgGenPlugin) {
+          await replyCard(message as never, "立绘", "立绘生成功能尚未启用。请确保 imgGen 插件已启用并配置了 API 信息。");
           return;
         }
 
@@ -2295,10 +2310,10 @@ ${menuBody}
           }
         }
 
-        // Rate limit check for non-admin users (once per day)
+        // Rate limit check for non-admin users (once per day, persisted)
         if (!isAdmin) {
-          const lastGen = portraitRateLimitMap.get(message.userId);
-          if (lastGen) {
+          if (player.portraitGeneratedAt) {
+            const lastGen = new Date(player.portraitGeneratedAt).getTime();
             const now = Date.now();
             const dayMs = 24 * 60 * 60 * 1000;
             if (now - lastGen < dayMs) {
@@ -2321,51 +2336,37 @@ ${menuBody}
         const groupName = sender?.card?.trim() || sender?.nickname?.trim() || message.userId;
 
         const prompt = [
-          "你是一个专业的日本二次元插画师，你现在的任务是要根据如下角色形象来绘制一个游戏的立绘，画风与配色要贴合角色形象：",
-          `名称：${groupName}`,
-          `种族 / 职业 / 性别：${race?.name ?? player.raceId} / ${classDef?.name ?? player.classId} / ${gender?.name ?? player.genderId}`,
-          `外貌：${player.appearance}`,
-          `个人宣言：${player.personalDeclaration || "无"}`,
-          "生成的图片要保证高质量与结构合理性、有一定的装扮。立绘角色动作要自然合理，好看美观，光影自然不要出现过度的明暗突变。",
+          "你是一个专业的日本二次元插画师，请根据以下角色设定绘制一张精致的立绘。画风为当代日式动画上色风格（赛璐珞/アニメ塗り），线条简洁流畅，配色柔和干净。",
+          `【角色】${groupName}`,
+          `【种族】${race?.name ?? player.raceId} — ${race?.description ?? ""}`,
+          `【职业】${classDef?.name ?? player.classId} — ${classDef?.description ?? ""}`,
+          `【性别】${gender?.name ?? player.genderId}`,
+          `【等级】Lv.${player.level}${player.rebirthCount > 0 ? `（${player.rebirthCount}转）` : ""}`,
+          `【外貌特征】${player.appearance}`,
+          `【个性签名】${player.personalDeclaration || "无"}`,
+          "要求：画面干净、人物突出、服装设计贴合职业特色（战士系铠甲/重装、法师系法袍/飘逸、游侠系轻甲/披风、牧师系祭司法袍、潜行者系皮甲/兜帽）。面部优先采用美少女/美少年画风，五官精致，表情柔和。背景可根据种族或职业主题适当装饰，角色周围可点缀一些相关的元素或光效来烘托氛围，但不要让画面变得杂乱。整体色调明亮通透。",
         ].join("\n");
 
         await ctx.replyText(message, "正在生成角色立绘，请稍候…");
 
         try {
-          const imageGenConfig: ImageGenConfig = {
-            baseUrl: fwConfig.imageApiBaseUrl,
-            apiKey: fwConfig.imageApiKey,
-            model: fwConfig.imageApiModel,
-          };
-
           const portraitDir = path.join(process.cwd(), "data", "portraits");
           const fileName = `portrait_${message.userId}_${Date.now()}.png`;
 
-          const outputPath = await generateAndSaveImage(
-            imageGenConfig,
-            prompt,
-            portraitDir,
-            fileName,
-            { size: "1024x1024", quality: "high" },
-          );
+          const result = await imgGenPlugin.generateImageFile(prompt, portraitDir, fileName);
 
           // Convert PNG to WebP for smaller file size
           let webpPath: string;
           try {
-            webpPath = await convertImageToWebp(outputPath);
+            webpPath = await convertImageToWebp(result.filePath);
           } catch {
-            webpPath = outputPath; // fallback to PNG
+            webpPath = result.filePath; // fallback to PNG
           }
 
           // Update player state
           player.portraitPath = webpPath;
-          player.portraitGeneratedAt = new Date().toISOString();
+          player.portraitGeneratedAt = result.generatedAt;
           savePlayer(player);
-
-          // Record rate limit
-          if (!isAdmin) {
-            portraitRateLimitMap.set(message.userId, Date.now());
-          }
 
           const target = resolveMessageTarget(message);
           await ctx.sendImage(target, webpPath, "角色立绘生成完成！");
@@ -2566,7 +2567,6 @@ ${menuBody}
 
     flush() {
       stateStore?.flush();
-      closeBrowser().catch(() => {});
     },
   };
 
@@ -2582,6 +2582,19 @@ ${menuBody}
     for (const item of bridgeItems) {
       if (!store.getItem(item.id)) {
         store.addItem(item);
+      }
+    }
+    // Register MMO consumable & material items into DataStorePlugin so economy
+    // inventory ($inventory) can display Chinese names for welfare-granted items.
+    for (const [id, def] of Object.entries(DEFAULT_MMORPG_CONTENT.items)) {
+      if (store.getItem(id)) continue;
+      if (def.category === "consumable" || def.category === "material" || def.category === "quest") {
+        store.addItem({
+          id: def.id,
+          name: def.name,
+          description: def.description ?? "",
+          price: def.sellPrice ?? 0,
+        });
       }
     }
   }

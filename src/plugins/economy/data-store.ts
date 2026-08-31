@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { UserProfile, ItemDef, DataStorePlugin } from "../../types.js";
 import type { MessageStore } from "../../message-store.js";
+import { MMORPG_RULEBOOK } from "../mmorpg/rulebook.js";
 
 const DEFAULT_ITEMS: ItemDef[] = [
   { id: "rose", name: "玫瑰", description: "表达爱意的红玫瑰", price: 10 },
@@ -29,8 +30,8 @@ function defaultProfile(): UserProfile {
 export function createDataStorePlugin(messageStore: MessageStore): DataStorePlugin {
   const users = new Map<string, UserProfile>();
   let items: ItemDef[] = [];
-  let saveTimer: NodeJS.Timeout | null = null;
   const dirtyUsers = new Set<string>();
+  let flushInterval: NodeJS.Timeout | null = null;
 
   // ── Load data (SQLite + JSON auto-migration) ────────────────────────
   function loadData() {
@@ -63,8 +64,47 @@ export function createDataStorePlugin(messageStore: MessageStore): DataStorePlug
 
     // Load from SQLite
     const profiles = messageStore.getAllUserProfiles();
+    let migratedCount = 0;
     for (const { userId, profile } of profiles) {
-      users.set(userId, ensureProfileShape(profile));
+      const shaped = ensureProfileShape(profile);
+      // Migrate: merge @-prefixed affinity keys (from old $affinity lookup bug)
+      for (const key of Object.keys(shaped.affinity.users)) {
+        if (key.startsWith("@")) {
+          const cleanKey = key.slice(1);
+          if (cleanKey) {
+            shaped.affinity.users[cleanKey] = Math.min(
+              MMORPG_RULEBOOK.social.maxAffinity,
+              (shaped.affinity.users[cleanKey] || 0) + shaped.affinity.users[key]
+            );
+          }
+          delete shaped.affinity.users[key];
+          migratedCount++;
+        }
+      }
+      // Same for interactionStats
+      for (const key of Object.keys(shaped.interactionStats.users)) {
+        if (key.startsWith("@")) {
+          const cleanKey = key.slice(1);
+          if (cleanKey) {
+            const existing = shaped.interactionStats.users[cleanKey] || { gifts: 0, mentions: 0, replies: 0 };
+            const bad = shaped.interactionStats.users[key];
+            existing.gifts += bad.gifts || 0;
+            existing.mentions += bad.mentions || 0;
+            existing.replies += bad.replies || 0;
+            shaped.interactionStats.users[cleanKey] = existing;
+          }
+          delete shaped.interactionStats.users[key];
+          migratedCount++;
+        }
+      }
+      users.set(userId, shaped);
+    }
+    if (migratedCount > 0) {
+      console.log(`[DataStore] 已迁移 ${migratedCount} 个 @-前缀键`);
+      // Persist the fixed profiles immediately
+      for (const [uid, profile] of users) {
+        messageStore.saveUserProfile(uid, profile);
+      }
     }
 
     const dbItems = messageStore.getAllItemDefs();
@@ -80,25 +120,24 @@ export function createDataStorePlugin(messageStore: MessageStore): DataStorePlug
 
   loadData();
 
-  // ── Debounced persist (only dirty profiles) ─────────────────────────
+  // ── Immediate write + periodic backup flush ─────────────────────────
   function persist() {
-    if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      try {
-        for (const userId of dirtyUsers) {
-          const profile = users.get(userId);
-          if (profile) {
-            messageStore.saveUserProfile(userId, profile);
-          }
+    if (dirtyUsers.size === 0) return;
+    for (const userId of dirtyUsers) {
+      const profile = users.get(userId);
+      if (profile) {
+        try {
+          messageStore.saveUserProfile(userId, profile);
+        } catch (error) {
+          console.error(`[DataStore] 保存失败 (${userId}):`, error);
         }
-        dirtyUsers.clear();
-      } catch (error) {
-        console.error("[DataStore] 保存失败:", error);
-      } finally {
-        saveTimer = null;
       }
-    }, 500);
+    }
+    dirtyUsers.clear();
   }
+
+  // Start periodic backup flush (every 5 seconds)
+  flushInterval = setInterval(() => persist(), 5000);
 
   return {
     name: "data-store",
@@ -119,25 +158,15 @@ export function createDataStorePlugin(messageStore: MessageStore): DataStorePlug
       const shaped = ensureProfileShape(profile);
       users.set(userId, shaped);
       dirtyUsers.add(userId);
-      persist();
+      persist(); // immediate write to SQLite
     },
 
     flush() {
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
+      if (flushInterval) {
+        clearInterval(flushInterval);
+        flushInterval = null;
       }
-      try {
-        for (const userId of dirtyUsers) {
-          const profile = users.get(userId);
-          if (profile) {
-            messageStore.saveUserProfile(userId, profile);
-          }
-        }
-        dirtyUsers.clear();
-      } catch (error) {
-        console.error("[DataStore] 立即保存失败:", error);
-      }
+      persist();
     },
 
     getAllUserEntries() {
@@ -168,6 +197,7 @@ function ensureProfileShape(profile: UserProfile): UserProfile {
   nextProfile.lastAutoCheckinNoticeDate ??= null;
   nextProfile.affinity ??= { ai: 0, users: {} };
   nextProfile.affinity.users ??= {};
+  nextProfile.dailyGifts ??= { date: "", count: 0 };
   nextProfile.interactionStats ??= {
     ai: { gifts: 0, chats: 0 },
     users: {},

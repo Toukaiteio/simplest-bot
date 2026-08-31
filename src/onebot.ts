@@ -11,8 +11,9 @@ import type {
 } from "./types.js";
 import { decodeMediaId, encodeMediaId, mediaPlaceholder } from "./media-ids.js";
 
-const FORWARD_THRESHOLD = 3000;
+export const FORWARD_THRESHOLD = 3000;
 const FORWARD_CHUNK_SIZE = 4000;
+export const TEXT_CHUNK_SIZE = 1800;
 
 type PendingAction = {
   action: string;
@@ -23,7 +24,7 @@ type PendingAction = {
 
 type OneBotEvents = {
   message: [message: BotMessage];
-  request: [event: { requestType: string; userId: string; flag: string; comment: string }];
+  request: [event: { requestType: string; subType?: string; groupId?: string; userId: string; flag: string; comment: string }];
   connected: [];
   disconnected: [];
   error: [error: Error];
@@ -81,11 +82,18 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
 
   async sendText(target: NotifyTarget, text: string) {
     if (text.length > FORWARD_THRESHOLD) {
-      await this.sendForwardMessage(target, text);
+      await this.sendLongText(target, text);
       return;
     }
     const segments = safeCqToSegments(text);
     await this.sendSegments(target, segments);
+  }
+
+  async sendLongText(target: NotifyTarget, text: string) {
+    const chunks = splitLongText(text, TEXT_CHUNK_SIZE);
+    for (const chunk of chunks) {
+      await this.sendSegments(target, safeCqToSegments(chunk));
+    }
   }
 
   async sendForwardMessage(target: NotifyTarget, text: string) {
@@ -97,15 +105,46 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     const nodes: OneBotMessageSegment[] = chunks.map((chunk) => ({
       type: "node",
       data: {
-        name: botInfo.nickname,
-        uin: botInfo.userId,
+        nickname: botInfo.nickname,
+        user_id: botInfo.userId,
         content: [{ type: "text", data: { text: chunk } }],
       },
     }));
+
+    try {
+      if (target.type === "group") {
+        await this.sendAction("send_forward_msg", { message_type: "group", group_id: numericId(target.id), messages: nodes });
+      } else {
+        await this.sendAction("send_forward_msg", { message_type: "private", user_id: numericId(target.id), messages: nodes });
+      }
+      return;
+    } catch (error) {
+      console.warn("[OneBot] send_forward_msg 失败，尝试旧合并转发接口:", error);
+    }
+
+    const legacyNodes = nodes.map((node) => ({
+      ...node,
+      data: {
+        name: botInfo.nickname,
+        uin: botInfo.userId,
+        content: node.data.content,
+      },
+    }));
+    try {
+      if (target.type === "group") {
+        await this.sendAction("send_group_forward_msg", { group_id: numericId(target.id), messages: legacyNodes });
+      } else {
+        await this.sendAction("send_private_forward_msg", { user_id: numericId(target.id), messages: legacyNodes });
+      }
+      return;
+    } catch (error) {
+      console.warn("[OneBot] 旧合并转发接口失败，尝试 send_msg node 消息段:", error);
+    }
+
     if (target.type === "group") {
-      await this.sendAction("send_group_forward_msg", { group_id: target.id, messages: nodes });
+      await this.sendAction("send_msg", { message_type: "group", group_id: numericId(target.id), message: nodes });
     } else {
-      await this.sendAction("send_private_forward_msg", { user_id: target.id, messages: nodes });
+      await this.sendAction("send_msg", { message_type: "private", user_id: numericId(target.id), message: nodes });
     }
   }
 
@@ -427,6 +466,8 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     if (parsed.post_type === "request") {
       this.emit("request", {
         requestType: String(parsed.request_type ?? ""),
+        subType: parsed.sub_type ? String(parsed.sub_type) : undefined,
+        groupId: parsed.group_id ? String(parsed.group_id) : undefined,
         userId: String(parsed.user_id ?? ""),
         flag: String(parsed.flag ?? ""),
         comment: String(parsed.comment ?? ""),
@@ -449,6 +490,10 @@ function appendAccessToken(url: string, accessToken: string) {
   const parsed = new URL(url);
   if (!parsed.searchParams.has("access_token")) parsed.searchParams.set("access_token", accessToken);
   return parsed.toString();
+}
+
+function numericId(value: string): string | number {
+  return /^\d+$/.test(value) ? Number(value) : value;
 }
 
 function safeJsonParse(payload: string): OneBotInboundEvent | undefined {
@@ -656,7 +701,7 @@ function parseJsonCard(jsonString: string): string {
  * 将可能包含 CQ 码的文本转换为安全的消息段数组。
  * 例如 "回复 [CQ:at,qq=123] 你好" → [text("回复 "), at(123), text(" 你好")]
  */
-function safeCqToSegments(value: string): OneBotMessageSegment[] {
+export function safeCqToSegments(value: string): OneBotMessageSegment[] {
   const segments: OneBotMessageSegment[] = [];
   const cqRegex = /\[CQ:([a-zA-Z0-9_]+),([^\]]*)\]/g;
   let lastIndex = 0;
@@ -696,6 +741,31 @@ function safeCqToSegments(value: string): OneBotMessageSegment[] {
   }
 
   return segments.length > 0 ? segments : [{ type: "text", data: { text: value } }];
+}
+
+export function splitLongText(text: string, maxChars = TEXT_CHUNK_SIZE): string[] {
+  if (text.length <= maxChars) return [text];
+
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1);
+    const breakAt = findTextBreak(window, maxChars);
+    chunks.push(rest.slice(0, breakAt).trimEnd());
+    rest = rest.slice(breakAt).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function findTextBreak(text: string, maxChars: number): number {
+  const candidates = ["\n\n", "\n", "。", "！", "？", "；", ";", ". ", ", ", " "];
+  const minUseful = Math.floor(maxChars * 0.55);
+  for (const candidate of candidates) {
+    const idx = text.lastIndexOf(candidate, maxChars);
+    if (idx >= minUseful) return idx + candidate.length;
+  }
+  return maxChars;
 }
 
 function cqStringToText(value: string) {

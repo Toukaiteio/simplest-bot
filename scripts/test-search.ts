@@ -1,0 +1,10 @@
+import { buildSearchIndex, searchIndex, searchWorks } from "../src/plugins/anime-guessr/search-index.js";
+import { loadCharacterDatabase } from "../src/plugins/anime-guessr/data.js";
+const db = loadCharacterDatabase("data/anime-characters.json");
+buildSearchIndex(db);
+console.log("Index built:", db.length);
+console.log("yeshenyue:", searchIndex("yeshenyue", 3).map(r => `${r.char.nameCn??r.char.name} [${r.matchedField}]`));
+console.log("ysy:", searchIndex("ysy", 3).map(r => `${r.char.nameCn??r.char.name} [${r.matchedField}]`));
+console.log("saber:", searchIndex("saber", 3).map(r => `${r.char.nameCn??r.char.name} [${r.matchedField}]`));
+console.log("mklhls:", searchIndex("mklhls", 3).map(r => `${r.char.nameCn??r.char.name} [${r.matchedField}]`));
+console.log("死亡笔记:", searchWorks("死亡笔记", 2).map(r => `${r.nameCn} (${r.characters.length} chars)`));

@@ -69,6 +69,7 @@ export function createCheckinPlugin(
     },
 
     onLoad(ctx: PluginContext) {
+      menuPlugin.registerCommandGroup("economy", "经济与社交", "签到、商城、礼物、亲密度、福利");
       menuPlugin.registerCommand("checkin", "每日签到领取金币", async (message: BotMessage) => {
         const userId = message.userId!;
         const result = this.checkin(userId);

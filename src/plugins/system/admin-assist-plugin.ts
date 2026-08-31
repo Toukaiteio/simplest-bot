@@ -25,6 +25,7 @@ type AdminAssistPlugin = Plugin & {
 type ActivitySample = {
   timestamp: number;
   category: string;
+  detail?: string;
   idleSeconds: number | null;
 };
 
@@ -55,6 +56,7 @@ type CachedValue<T> = {
 
 type RawActivitySnapshot = {
   processName?: string;
+  windowTitle?: string;
   idleSeconds?: number;
   capturedAt?: string;
 };
@@ -107,6 +109,7 @@ if ([WinApi]::GetLastInputInfo([ref]$lastInput)) {
 
 [ordered]@{
   processName = $processName
+  windowTitle = if ($title.Length -gt 0) { $title.ToString() } else { $null }
   idleSeconds = $idleSeconds
   capturedAt = (Get-Date).ToString("o")
 } | ConvertTo-Json -Compress
@@ -157,15 +160,15 @@ export function createAdminAssistPlugin(onebot: OneBotClient, adminUserIds: stri
     name: "admin-assist",
     description: "标记管理员消息，并在管理员被 @ 后超时未回复时由 AI 协助回复",
     systemPromptAppend: [
-      "系统会明确标记当前消息发送者是否为机器人管理员。",
-      "当群成员 @ 机器人管理员但管理员暂未回复时，你可能会被要求先行协助。",
-      "如系统提供了脱敏活动摘要，只能据此做概率判断，不要声称掌握管理员的具体屏幕内容。",
-      "如需通知某位管理员或用户，可调用 send_private_message 工具发送私聊消息。",
-      "管理员可通过私聊要求你向指定群发送消息，使用 send_group_message 工具；可先调用 get_group_list 查看群号。",
-      "可调用 check_is_friend 工具检查某人是否为机器人好友。主动添加好友受平台限制暂不支持，需要对方主动加机器人。",
-      "可调用 get_friend_list 查看好友列表，get_group_list 查看群列表。",
-      "如果用户消息被截断，系统会标注完整字数和查看 ID，可调用 read_full_message 工具查看全文。",
-      "管理员说要去某处或暂时离开时，调用 set_away_status 设置离开原因；管理员说回来了时调用 clear_away_status 清除。send_private_message 和 send_group_message 仅限管理员使用。",
+      "消息会标明发送者是不是机器人管理员。",
+      "如果有人 @ 管理员但管理员暂时没回应，你可能会被叫去先帮忙看看。",
+      "如果给了脱敏的活动摘要，只能大概猜猜管理员在不在或可能在忙什么，别说得好像你真能看到屏幕一样。",
+      "想通知谁可以用 send_private_message 发私聊。",
+      "管理员可以在私聊里让你给某个群发消息，用 send_group_message 就行（不记得群号可以先用 get_group_list 查）。",
+      "用 check_is_friend 看看某人是不是好友——主动加好友目前做不到，得对方来加机器人。",
+      "get_friend_list 看好友列表，get_group_list 看群列表。",
+      "如果用户发的消息太长被截了，会标注完整长度和查看用的 ID，用 read_full_message 工具可以看全文。",
+      "管理员说要去忙/离开一下就用 set_away_status，回来了用 clear_away_status。send_private_message 和 send_group_message 只有管理员能用。reply_in_group 可以让机器人在群里用自己的语气和知识自主回复，适合需要 bot 参与讨论的场景。",
     ].join("\n"),
 
     setHandler(nextHandler) {
@@ -178,11 +181,11 @@ export function createAdminAssistPlugin(onebot: OneBotClient, adminUserIds: stri
 
     async onLoad(ctx) {
       ctxRef = ctx;
-      captureActivitySample(activitySamples, ctx, activitySampleLock);
+      captureActivitySample(activitySamples, ctx, activitySampleLock, adminUserIds);
 
       const intervalMs = ctx.config.pluginSettings.adminAssist.activitySampleIntervalSeconds * 1000;
       sampleTimer = setInterval(() => {
-        captureActivitySample(activitySamples, ctx, activitySampleLock);
+        captureActivitySample(activitySamples, ctx, activitySampleLock, adminUserIds);
       }, intervalMs);
     },
 
@@ -372,6 +375,41 @@ export function createAdminAssistPlugin(onebot: OneBotClient, adminUserIds: stri
             }
             await ctx.sendMessage({ type: "group", id: groupId }, text);
             return `已向群 ${groupId} 发送消息。`;
+          }
+        ),
+        makeTool(
+          "reply_in_group",
+          "代替管理员在群内回复消息或展开话题。bot 会理解上下文、使用自己的语气和知识库来生成自然的回复。仅管理员可使用。需提供目标群号和要回应的内容描述。",
+          {
+            type: "object",
+            properties: {
+              groupId: { type: "string", description: "目标群的群号，纯数字" },
+              instruction: { type: "string", description: "对 bot 的说明：要回复什么、参考什么信息、用什么语气或角度等" },
+            },
+            required: ["groupId", "instruction"],
+          },
+          async (args, input) => {
+            requireAdmin(input, adminIdSet);
+            const currentHandler = handler;
+            if (!currentHandler) throw new Error("插件尚未就绪。");
+
+            const groupId = String(args.groupId ?? "").trim();
+            if (!/^\d+$/.test(groupId)) throw new Error("groupId 必须为纯数字群号。");
+            const instruction = requireString(args.instruction, "instruction");
+
+            const msg: BotMessage = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+            const synthetic: BotMessage = {
+              type: "group",
+              groupId,
+              userId: msg.userId ?? "0",
+              text: instruction,
+              raw: {} as any,
+            };
+
+            const appends = await currentHandler.buildDynamicPromptAppends(synthetic);
+            const reply = await currentHandler.generateReply(synthetic, appends);
+            await currentHandler.sendReply(synthetic, reply);
+            return `已在群 ${groupId} 中回复。`;
           }
         ),
         makeTool(
@@ -797,7 +835,8 @@ function cancelPendingMentions(
 async function captureActivitySample(
   activitySamples: ActivitySample[],
   ctx: PluginContext,
-  lock: { current: Promise<void> | null }
+  lock: { current: Promise<void> | null },
+  adminUserIds: string[]
 ) {
   if (lock.current) {
     console.log("[AdminAssist] 上一次活动采样尚未完成，跳过本次采样");
@@ -806,6 +845,13 @@ async function captureActivitySample(
 
   lock.current = (async () => {
     const start = Date.now();
+
+    // Fetch Steam game info in parallel with local activity
+    const { steamApiKey, steamUserIds } = ctx.config.pluginSettings.adminAssist;
+    if (steamApiKey && Object.keys(steamUserIds).length > 0) {
+      fetchSteamGames(steamApiKey, steamUserIds).catch(() => {});
+    }
+
     const raw = await getRawActivitySnapshot();
     const elapsed = Date.now() - start;
 
@@ -816,14 +862,34 @@ async function captureActivitySample(
 
     const category = categorizeProcess(raw.processName);
     const idleSeconds = normalizeIdleSeconds(raw.idleSeconds);
+
+    // Enrich with detail: prefer Steam game name, fall back to window title for games
+    let detail: string | undefined;
+    if (category === "游戏娱乐") {
+      // Try to find a Steam game for any admin user
+      for (const adminId of adminUserIds) {
+        const steamGame = getSteamGameForUser(adminId);
+        if (steamGame) {
+          detail = steamGame.gameName;
+          break;
+        }
+      }
+      // Fall back to window title if no Steam data
+      if (!detail && raw.windowTitle) {
+        detail = raw.windowTitle;
+      }
+    }
+
     activitySamples.push({
       timestamp: parseTimestamp(raw.capturedAt),
       category,
+      detail,
       idleSeconds,
     });
 
     trimActivitySamples(activitySamples, ctx.config.pluginSettings.adminAssist.activityLookbackMinutes);
-    console.log(`[AdminAssist] 活动采样成功：category=${category}, idle=${idleSeconds ?? "unknown"}s, 耗时 ${elapsed}ms`);
+    const detailLog = detail ? `, detail=${detail}` : "";
+    console.log(`[AdminAssist] 活动采样成功：category=${category}${detailLog}, idle=${idleSeconds ?? "unknown"}s, 耗时 ${elapsed}ms`);
   })();
 
   try {
@@ -863,6 +929,58 @@ async function getRawActivitySnapshot(): Promise<RawActivitySnapshot | null> {
     console.error("[AdminAssist] 采集电脑活动失败:", error);
     return null;
   }
+}
+
+// ── Steam API ──────────────────────────────────────────────────────────────
+
+type SteamGameData = {
+  gameName: string;
+  gameId?: string;
+};
+
+const steamGameCache = new Map<string, SteamGameData>();
+let steamLastFetchAt = 0;
+const STEAM_FETCH_INTERVAL_MS = 60_000; // poll Steam API every 60 seconds
+
+async function fetchSteamGames(
+  steamApiKey: string,
+  steamUserIds: Record<string, string>
+): Promise<void> {
+  const now = Date.now();
+  if (now - steamLastFetchAt < STEAM_FETCH_INTERVAL_MS) return;
+  steamLastFetchAt = now;
+
+  for (const [qqId, steamId] of Object.entries(steamUserIds)) {
+    if (!steamId) continue;
+    try {
+      const url = `https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=${steamApiKey}&steamids=${steamId}`;
+      const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) continue;
+      const json = (await response.json()) as {
+        response?: {
+          players?: Array<{
+            gameextrainfo?: string;
+            gameid?: string;
+          }>;
+        };
+      };
+      const player = json.response?.players?.[0];
+      if (player?.gameextrainfo) {
+        steamGameCache.set(qqId, {
+          gameName: player.gameextrainfo,
+          gameId: player.gameid,
+        });
+      } else {
+        steamGameCache.delete(qqId);
+      }
+    } catch {
+      // Steam API failure is non-critical; skip silently
+    }
+  }
+}
+
+function getSteamGameForUser(qqId: string): SteamGameData | undefined {
+  return steamGameCache.get(qqId);
 }
 
 function summarizeRecentActivity(
@@ -905,9 +1023,14 @@ function compressActivitySegments(
   const segments: Array<{ start: number; end: number; label: string }> = [];
 
   for (const sample of recentSamples) {
-    const label = sample.idleSeconds !== null && sample.idleSeconds >= awayIdleThresholdSeconds
-      ? "暂时离开电脑"
-      : sample.category;
+    let label: string;
+    if (sample.idleSeconds !== null && sample.idleSeconds >= awayIdleThresholdSeconds) {
+      label = "暂时离开电脑";
+    } else if (sample.detail) {
+      label = `${sample.category}（${sample.detail}）`;
+    } else {
+      label = sample.category;
+    }
 
     const previous = segments[segments.length - 1];
     if (previous && previous.label === label) {
@@ -935,7 +1058,8 @@ function getDominantCategories(
     if (sample.idleSeconds !== null && sample.idleSeconds >= awayIdleThresholdSeconds) {
       continue;
     }
-    counts.set(sample.category, (counts.get(sample.category) ?? 0) + 1);
+    const label = sample.detail ? `${sample.category}（${sample.detail}）` : sample.category;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
   }
 
   return [...counts.entries()]

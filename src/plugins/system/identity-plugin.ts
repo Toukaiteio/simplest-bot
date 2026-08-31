@@ -125,7 +125,7 @@ async function getRuntimeIdentity(
     : undefined;
 
   const uniqueAdminUserIds = [...new Set(adminUserIds.filter(Boolean))];
-  const admins = await Promise.all(uniqueAdminUserIds.map(async (adminUserId) => {
+  const admins = (await Promise.all(uniqueAdminUserIds.map(async (adminUserId) => {
     const stranger = await getCachedMap(
       cache.strangerCache,
       adminUserId,
@@ -143,12 +143,17 @@ async function getRuntimeIdentity(
       ).catch(() => undefined)
       : undefined;
 
+    // 在群聊中，只返回实际在群内的管理员；私聊中返回所有管理员
+    if (groupId && !member) {
+      return null;
+    }
+
     return {
       userId: adminUserId,
       nickname: member?.nickname || stranger.nickname,
       groupCard: member?.card?.trim() ? member.card : undefined,
     };
-  }));
+  }))).filter((admin): admin is NonNullable<typeof admin> => admin !== null);
 
   return { bot, group, admins };
 }

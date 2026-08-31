@@ -15,12 +15,15 @@ export function createDebouncePlugin(
 ): DebouncePlugin {
   let handler: DebounceHandler | null = null;
   const buffers = new Map<string, BufferEntry>();
+  const locks = new Map<string, boolean>();
 
   function getKey(message: BotMessage): string {
     return message.type === "group" ? `group:${message.groupId}` : `private:${message.userId}`;
   }
 
   async function flush(key: string) {
+    if (locks.get(key)) return;
+
     const entry = buffers.get(key);
     if (!entry || entry.messages.length === 0) return;
 
@@ -29,50 +32,49 @@ export function createDebouncePlugin(
       entry.timer = null;
     }
 
-    const messages = entry.messages;
-    buffers.delete(key);
+    locks.set(key, true);
 
-    if (!handler) return;
+    const messages = entry.messages;
+    entry.messages = [];
+
+    if (!handler) {
+      locks.delete(key);
+      return;
+    }
 
     try {
-      const validMessages: BotMessage[] = [];
-      for (const msg of messages) {
+      const triggerIndexes: number[] = [];
+      for (let index = 0; index < messages.length; index += 1) {
+        const msg = messages[index];
         const shouldReply = await handler.shouldReplyCheck(msg);
-        if (shouldReply) {
-          validMessages.push(msg);
-        }
+        if (shouldReply) triggerIndexes.push(index);
       }
 
-      if (validMessages.length === 0) return;
+      if (triggerIndexes.length > 0) {
+        // 触发判定只决定是否回复；同一 burst 的全部消息都交给上下文层。
+        const triggerIndex = triggerIndexes[triggerIndexes.length - 1];
+        const reply = await handler.chatBatch(messages, triggerIndex);
 
-      const reply = await handler.chatBatch(validMessages);
-      const parts = await handler.splitResponse(reply);
+        const triggerMessage = messages[triggerIndex];
+        const target = triggerMessage.type === "group"
+          ? { type: "group" as const, id: triggerMessage.groupId! }
+          : { type: "private" as const, id: triggerMessage.userId! };
 
-      const target = validMessages[validMessages.length - 1].type === "group"
-        ? { type: "group" as const, id: validMessages[validMessages.length - 1].groupId! }
-        : { type: "private" as const, id: validMessages[validMessages.length - 1].userId! };
-
-      if (parts) {
-        for (const part of parts) {
-          const trimmed = part.trim();
-          if (!trimmed) continue;
-          const segments = await handler.transformResponse(trimmed);
-          if (segments) {
-            await handler.sendSegments(target, segments);
-          } else {
-            await handler.sendSegments(target, [{ type: "text", data: { text: trimmed } }]);
-          }
-        }
-      } else {
-        const segments = await handler.transformResponse(reply);
-        if (segments) {
-          await handler.sendSegments(target, segments);
-        } else {
-          await handler.sendSegments(target, [{ type: "text", data: { text: reply } }]);
-        }
+        const context = target.type === "group" ? { groupId: target.id } : undefined;
+        await handler.sendResponse(target, reply, context);
       }
     } catch (error) {
       console.error("[Debounce] 处理失败:", error);
+    } finally {
+      locks.delete(key);
+      const remaining = buffers.get(key);
+      if (remaining && remaining.messages.length > 0) {
+        remaining.timer = setTimeout(() => {
+          void flush(key);
+        }, windowMs);
+      } else if (remaining) {
+        buffers.delete(key);
+      }
     }
   }
 
@@ -98,6 +100,8 @@ export function createDebouncePlugin(
       entry.messages.push(message);
 
       if (entry.timer) clearTimeout(entry.timer);
+
+      if (locks.get(key)) return true;
 
       if (entry.messages.length >= maxBatch) {
         void flush(key);

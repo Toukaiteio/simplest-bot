@@ -2,6 +2,7 @@ import type { PluginContext, BotMessage, Plugin } from "../../types.js";
 
 type AutoApproveHandler = {
   approveFriendRequest: (flag: string) => Promise<void>;
+  approveGroupInvite: (flag: string, groupId: string) => Promise<void>;
 };
 
 export type AutoApprovePlugin = Plugin & {
@@ -13,14 +14,14 @@ export function createAutoApprovePlugin(): AutoApprovePlugin {
 
   return {
     name: "auto-approve",
-    description: "自动同意所有好友添加请求（谨慎使用）",
+    description: "自动同意好友添加请求和群邀请入群请求",
 
     setHandler(h: AutoApproveHandler) {
       handler = h;
     },
 
     async onLoad() {
-      console.log("[AutoApprove] 已启用，将自动同意所有好友请求");
+      console.log("[AutoApprove] 已启用，将自动同意好友请求和群邀请入群请求");
     },
   };
 }

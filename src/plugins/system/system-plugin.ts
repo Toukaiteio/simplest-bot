@@ -8,24 +8,49 @@ import type {
 } from "../../types.js";
 import type { MemoryManager } from "../../memory.js";
 import type { PluginManager } from "../../plugin.js";
+import type { ContextManager } from "../../context/context-manager.js";
 
 export function createSystemPlugin(
   memory: MemoryManager,
   pluginManager: PluginManager,
   blacklistPlugin: BlacklistPlugin,
   groupTriggerPlugin: GroupTriggerPlugin,
-  menuPlugin: MenuPlugin
+  menuPlugin: MenuPlugin,
+  contextManager?: ContextManager
 ): Plugin {
   return {
     name: "system",
     description: "系统管理命令与内置服务",
 
     onLoad(ctx: PluginContext) {
+      menuPlugin.registerCommandGroup("system", "系统管理", "插件管理、黑名单、关键词过滤");
       const prefix = menuPlugin.getPrefix();
 
       menuPlugin.registerCommand("clear", "清除当前对话历史 [管理员]", async (message: BotMessage) => {
         memory.clearHistory(message);
+        if (contextManager) {
+          const key = message.type === "private" ? `user:${message.userId}` : `group:${message.groupId}`;
+          contextManager.clearSession(key);
+        }
         await ctx.replyText(message, "对话历史已清除。");
+      }, { adminOnly: true });
+
+      menuPlugin.registerCommand("compress", "手动触发上下文压缩 [管理员]", async (message: BotMessage) => {
+        if (!contextManager) {
+          await ctx.replyText(message, "上下文管理未启用。");
+          return;
+        }
+        const key = message.type === "private" ? `private:${message.userId}` : `group:${message.groupId}`;
+        const result = await contextManager.forceCompress(key);
+        if (!result) {
+          await ctx.replyText(message, "当前会话无上下文可压缩。");
+          return;
+        }
+        if (!result.compressed) {
+          await ctx.replyText(message, `当前上下文（实际 ${result.beforeTokens} tokens）已在预算内，无需压缩。`);
+          return;
+        }
+        await ctx.replyText(message, `压缩完成：实际 ${result.beforeTokens} → 估算 ${result.afterTokens} tokens，丢弃 ${result.droppedCount} 个旧 chunks。`);
       }, { adminOnly: true });
 
       menuPlugin.registerCommand("plugins", "列出已加载的插件", async (message: BotMessage) => {

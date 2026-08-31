@@ -32,7 +32,7 @@ export const MMORPG_RULEBOOK = {
     maxPartySize: 5,
     maxGuildMembers: 50,
     mailRetentionDays: 30,
-    marriageRequiredLevel: 120,
+    marriageRequiredLevel: 30,
     marriageRequiredAffinity: 5000,
     /** Maximum affinity value between two users. */
     maxAffinity: 10000,
@@ -188,13 +188,13 @@ export const MMORPG_RULEBOOK = {
     /** Items available in the MMO gold sink shop with their prices. */
     items: [
       { itemId: "small_healing_potion", price: 20 },
-      { itemId: "mid_healing_potion", price: 60 },
-      { itemId: "high_healing_potion", price: 150 },
+      { itemId: "mid_healing_potion", price: 350 },
+      { itemId: "high_healing_potion", price: 1500 },
       { itemId: "focus_tonic", price: 15 },
-      { itemId: "spirit_elixir", price: 200 },
-      { itemId: "war_elixir", price: 100 },
-      { itemId: "flame_ward_potion", price: 80 },
-      { itemId: "dragon_tonic", price: 400 },
+      { itemId: "spirit_elixir", price: 2000 },
+      { itemId: "war_elixir", price: 600 },
+      { itemId: "flame_ward_potion", price: 500 },
+      { itemId: "dragon_tonic", price: 5000 },
       { itemId: "antidote", price: 15 },
       { itemId: "alchemy_kit", price: 25 },
       { itemId: "field_ration", price: 10 },

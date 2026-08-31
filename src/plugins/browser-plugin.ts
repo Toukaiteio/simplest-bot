@@ -6,6 +6,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import type { Plugin, PromptBuildInput, LLMConfig } from "../types.js";
 import type { BotToolRegistration } from "../tooling.js";
+import { getBrowser as getSharedBrowser } from "../browser/browser-manager.js";
 
 export type BrowserConfig = {
   host: string;
@@ -121,39 +122,10 @@ class BrowserAgent {
       new HumanMessage(`用户任务：${prompt}`),
     ];
 
-    let browser;
-    let launched = false;
+    let page: Page | null = null;
     try {
-      if (this.config.chromePath) {
-        browser = await puppeteer.launch({
-          executablePath: this.config.chromePath,
-          headless: this.config.headless,
-          args: [
-            `--remote-debugging-port=${this.config.port}`,
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            ...this.config.launchArgs,
-          ],
-          defaultViewport: {
-            width: this.config.viewportWidth,
-            height: this.config.viewportHeight,
-          },
-          protocolTimeout: this.config.connectTimeoutMs,
-        });
-        launched = true;
-      } else {
-        browser = await puppeteer.connect({
-          browserURL: `http://${this.config.host}:${this.config.port}`,
-          defaultViewport: {
-            width: this.config.viewportWidth,
-            height: this.config.viewportHeight,
-          },
-          protocolTimeout: this.config.connectTimeoutMs,
-        });
-      }
-
-      const page = await browser.newPage();
+      const browser = await getSharedBrowser();
+      page = await browser.newPage();
       page.setDefaultNavigationTimeout(this.config.navigationTimeoutMs);
 
       for (let step = 0; step < this.config.maxAgentSteps; step++) {
@@ -168,14 +140,8 @@ class BrowserAgent {
       const message = error instanceof Error ? error.message : String(error);
       return `浏览器 Agent 执行失败：${message}`;
     } finally {
-      if (browser) {
-        try {
-          if (launched) {
-            await browser.close();
-          } else {
-            await browser.disconnect();
-          }
-        } catch { /* ignore */ }
+      if (page) {
+        try { await page.close(); } catch { /* ignore */ }
       }
     }
   }

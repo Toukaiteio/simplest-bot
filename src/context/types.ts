@@ -103,6 +103,8 @@ export type GroupMemberInfo = {
 export type GroupContext = {
   groupId?: string;
   groupName?: string;
+  /** 当前触发回复的用户；旧版单成员 fallback 只能用于该用户。 */
+  triggerUserId?: string;
   /** 触发消息发送者的名片（兼容旧用法） */
   memberCard?: string;
   memberNickname?: string;
