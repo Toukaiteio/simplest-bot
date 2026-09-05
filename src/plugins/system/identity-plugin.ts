@@ -1,5 +1,6 @@
 import type { MenuPlugin, Plugin, PluginContext, PromptBuildInput } from "../../types.js";
 import type { OneBotClient } from "../../onebot.js";
+import { getInputMessage } from "../../security/access-control.js";
 
 type CachedValue<T> = {
   expiresAt: number;
@@ -41,9 +42,7 @@ export function createIdentityPlugin(
       "系统会提供你的登录 QQ 号、当前群信息以及管理员身份信息。涉及身份或群名时请优先使用系统提供的准确信息。",
 
     async onBuildSystemPrompt(input: PromptBuildInput) {
-      const message = input.mode === "single"
-        ? input.message
-        : input.messages[input.messages.length - 1];
+      const message = getInputMessage(input);
 
       const identity = await getRuntimeIdentity(onebot, message.groupId, adminUserIds, {
         loginCacheRef: () => loginCache,

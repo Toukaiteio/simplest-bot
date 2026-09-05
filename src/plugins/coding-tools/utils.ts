@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { ToolError, Workspace, DEFAULT_EXCLUDED_NAMES, sanitizeRelativePath } from "./workspace.js";
 
 export function isBinary(data: Buffer): boolean {
@@ -60,13 +60,30 @@ export function searchWithRg(
   includeGlobs: string[], excludeGlobs: string[], contextLines: number, maxResults: number,
 ): any | null {
   try {
-    const rg = execSync("where rg", { encoding: "utf-8", timeout: 5000 }).split("\n")[0].trim() || "rg";
-    let args = `${rg} --json --line-number --color=never`;
-    if (!caseSensitive) args += " --ignore-case";
-    if (!regex) args += " --fixed-strings";
-    if (includeGlobs.length) args += includeGlobs.map(g => ` --glob "${g}"`).join("");
-    if (excludeGlobs.length) args += excludeGlobs.map(g => ` --glob "!${g}"`).join("");
-    const output = execSync(`${args} -- "${query}" "${searchDir}"`, { encoding: "utf-8", timeout: 10000, maxBuffer: 5*1024*1024 });
+    const lookup = spawnSync(process.platform === "win32" ? "where.exe" : "which", ["rg"], {
+      encoding: "utf-8",
+      timeout: 5000,
+      shell: false,
+      windowsHide: true,
+      env: { ...process.env, NO_COLOR: "1" },
+    });
+    const rg = String(lookup.stdout ?? "").split(/\r?\n/)[0].trim() || "rg";
+    const args = ["--json", "--line-number", "--color=never"];
+    if (!caseSensitive) args.push("--ignore-case");
+    if (!regex) args.push("--fixed-strings");
+    for (const glob of includeGlobs) args.push("--glob", glob);
+    for (const glob of excludeGlobs) args.push("--glob", `!${glob}`);
+    args.push("--", query, searchDir);
+    const result = spawnSync(rg, args, {
+      encoding: "utf-8",
+      timeout: 10000,
+      maxBuffer: 5 * 1024 * 1024,
+      shell: false,
+      windowsHide: true,
+      env: { ...process.env, NO_COLOR: "1", RG_PREFIX_CHECKSUM: "0" },
+    });
+    if (result.error || (result.status !== 0 && result.status !== 1)) return null;
+    const output = String(result.stdout ?? "");
     const matches: any[] = []; let total = 0; const fileCache: Record<string, string[]> = {};
     for (const raw of output.split("\n")) {
       if (!raw.trim()) continue;

@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { ToolError, Workspace } from "./workspace.js";
 import { truncateTextHead, parseGitBlame } from "./utils.js";
@@ -7,10 +7,15 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
   const ws = workspace;
 
   function isRepo(dir: string): boolean {
-    try { execSync(`git -C "${dir}" rev-parse --is-inside-work-tree`, { encoding: "utf-8", timeout: 5000, stdio: "ignore" }); return true; } catch { return false; }
+    try {
+      runGitAt(dir, ["rev-parse", "--is-inside-work-tree"], 5000);
+      return true;
+    } catch {
+      return false;
+    }
   }
   function git(...args: string[]): string {
-    return execSync(`git -C "${ws.root}" ${args.join(" ")}`, { encoding: "utf-8", timeout: 10000 });
+    return runGitAt(ws.root, args, 10000);
   }
 
   return [
@@ -19,9 +24,9 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
       execute: async (args: any) => {
         if (!isRepo(ws.root)) return JSON.stringify({ is_repo: false, clean: true, entries: [] });
         const includeUntracked = args.includeUntracked !== false;
-        let cmd = `git -C "${ws.root}" status --porcelain=v1 -b`;
-        if (!includeUntracked) cmd += " --untracked-files=no";
-        const output = execSync(cmd, { encoding: "utf-8", timeout: 10000 });
+        const statusArgs = ["status", "--porcelain=v1", "-b"];
+        statusArgs.push(includeUntracked ? "--untracked-files=all" : "--untracked-files=no");
+        const output = git(...statusArgs);
         const lines = output.split("\n").filter(Boolean);
         let branch = "", upstream = "", ahead = 0, behind = 0;
         const entries: any[] = [];
@@ -42,7 +47,7 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
           if (p.includes(" -> ")) { const sp = p.split(" -> "); o = sp[0]; p = sp[1]; }
           entries.push({ path: p, original_path: o, index_status: line[0], worktree_status: line[1] });
         }
-        return JSON.stringify({ is_repo: true, branch, head: execSync(`git -C "${ws.root}" rev-parse --short HEAD`, { encoding: "utf-8", timeout: 5000 }).trim(), upstream, ahead, behind, clean: !entries.length, entries });
+        return JSON.stringify({ is_repo: true, branch, head: git("rev-parse", "--short", "HEAD").trim(), upstream, ahead, behind, clean: !entries.length, entries });
       },
     },
     {
@@ -53,8 +58,17 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
         const context = Math.max(0, Number(args.contextLines) || 3); const maxBytes = Number(args.maxBytes) || 262144;
         const pathFilter = args.path ? String(args.path) : "";
         let combined = "";
-        if (unstaged) { let c = `git -C "${ws.root}" diff --unified=${context}`; if (pathFilter) c += ` -- "${pathFilter}"`; combined += execSync(c, { encoding: "utf-8", timeout: 10000 }); }
-        if (staged) { let c = `git -C "${ws.root}" diff --cached --unified=${context}`; if (pathFilter) c += ` -- "${pathFilter}"`; combined += execSync(c, { encoding: "utf-8", timeout: 10000 }); }
+        const safePath = pathFilter ? ws.resolveForWrite(pathFilter).display : "";
+        if (unstaged) {
+          const args = ["diff", "--no-ext-diff", "--no-textconv", `--unified=${context}`];
+          if (safePath) args.push("--", safePath);
+          combined += git(...args);
+        }
+        if (staged) {
+          const args = ["diff", "--cached", "--no-ext-diff", "--no-textconv", `--unified=${context}`];
+          if (safePath) args.push("--", safePath);
+          combined += git(...args);
+        }
         const trunc = truncateTextHead(combined, 2000, maxBytes);
         return JSON.stringify({ diff: trunc.content, files: combined.match(/^diff --git a\/(.+?) b\//gm)?.map(m => ({ path: m.replace(/^diff --git a\//, "").replace(/ b\/.*$/, ""), status: "modified" })) ?? [], truncated: trunc.truncated, truncated_by: trunc.truncatedBy });
       },
@@ -64,11 +78,11 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
       execute: async (args: any) => {
         const pathArg = String(args.path ?? "."); const resolved = ws.resolveExisting(pathArg);
         if (!isRepo(resolved.resolved)) return JSON.stringify({ is_repo: false, commits: [] });
-        const ref = String(args.ref ?? "HEAD").replace(/[^a-zA-Z0-9._\-\/]/g, "");
+        const ref = sanitizeGitRevision(args.ref ?? "HEAD");
         const maxCount = Math.min(100, Math.max(1, Number(args.maxCount) || 20)); const skip = Math.max(0, Number(args.skip) || 0);
-        let cmd = `git -C "${ws.root}" log --max-count=${maxCount + 1} --skip=${skip} --date=iso-strict --pretty=format:"%H|%h|%an|%ae|%ad|%s" ${ref}`;
-        if (resolved.display !== ".") cmd += ` -- "${resolved.display}"`;
-        const output = execSync(cmd, { encoding: "utf-8", timeout: 10000 });
+        const logArgs = ["log", `--max-count=${maxCount + 1}`, `--skip=${skip}`, "--date=iso-strict", "--pretty=format:%H|%h|%an|%ae|%ad|%s", ref];
+        if (resolved.display !== ".") logArgs.push("--", resolved.display);
+        const output = git(...logArgs);
         const records = output.split("\n").filter(Boolean);
         const commits = records.slice(0, maxCount).map(r => { const p = r.split("|"); return p.length >= 6 ? { hash: p[0], short_hash: p[1], author_name: p[2], author_email: p[3], author_date: p[4], subject: p.slice(5).join("|") } : null; }).filter(Boolean);
         return JSON.stringify({ is_repo: true, ref, path: resolved.display, commits, truncated: records.length > maxCount });
@@ -78,9 +92,9 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
       definition: { type: "function", function: { name: "workspace_git_show", description: "显示指定 Git 提交的详细信息。", parameters: { type: "object", properties: { rev: { type: "string" }, contextLines: { type: "number" }, maxBytes: { type: "number" } } } } },
       execute: async (args: any) => {
         if (!isRepo(ws.root)) return JSON.stringify({ is_repo: false });
-        const rev = String(args.rev ?? "HEAD").replace(/[^a-zA-Z0-9._\-\/]/g, "");
+        const rev = sanitizeGitRevision(args.rev ?? "HEAD");
         const context = Math.max(0, Number(args.contextLines) || 3); const maxBytes = Number(args.maxBytes) || 262144;
-        const output = execSync(`git -C "${ws.root}" show --no-ext-diff --format=fuller --unified=${context} ${rev}`, { encoding: "utf-8", timeout: 10000 });
+        const output = git("show", "--no-ext-diff", "--no-textconv", "--format=fuller", `--unified=${context}`, rev);
         const trunc = truncateTextHead(output, 2000, maxBytes);
         return JSON.stringify({ is_repo: true, rev, content: trunc.content, truncated: trunc.truncated });
       },
@@ -94,9 +108,49 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
         const startLine = Math.max(1, Number(args.startLine) || 1);
         const maxLines = Math.min(1000, Math.max(1, Number(args.maxLines) || 200));
         const finalLine = Math.min(args.endLine !== undefined ? Number(args.endLine) : (startLine + maxLines - 1), startLine + maxLines - 1);
-        const output = execSync(`git -C "${ws.root}" blame --line-porcelain -L ${startLine},${finalLine} -- "${resolved.display}"`, { encoding: "utf-8", timeout: 10000 });
+        const output = git("blame", "--line-porcelain", `-L${startLine},${finalLine}`, "--", resolved.display);
         return JSON.stringify({ is_repo: true, path: resolved.display, start_line: startLine, end_line: finalLine, lines: parseGitBlame(output), truncated: false });
       },
     },
   ];
+}
+
+function runGitAt(dir: string, args: string[], timeout: number): string {
+  const result = spawnSync("git", ["-C", dir, ...args], {
+    encoding: "utf-8",
+    timeout,
+    maxBuffer: 8 * 1024 * 1024,
+    shell: false,
+    windowsHide: true,
+    env: {
+      PATH: process.env.PATH ?? "",
+      PATHEXT: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
+      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+      ComSpec: process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe",
+      TEMP: dir,
+      TMP: dir,
+      HOME: dir,
+      USERPROFILE: dir,
+      XDG_CONFIG_HOME: dir,
+      GIT_CONFIG_GLOBAL: `${dir}\\.agent-empty-gitconfig`,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_PAGER: "cat",
+      GIT_TERMINAL_PROMPT: "0",
+    },
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const stderr = String(result.stderr ?? "").trim();
+    throw new ToolError("GIT_FAILED", stderr || `Git 退出码 ${result.status ?? -1}`);
+  }
+  return String(result.stdout ?? "");
+}
+
+function sanitizeGitRevision(value: unknown): string {
+  const revision = String(value ?? "HEAD").trim();
+  if (!revision || revision.startsWith("-") || revision.includes("..") || !/^[a-zA-Z0-9._~^:/-]+$/.test(revision)) {
+    throw new ToolError("INVALID_ARGUMENT", "Git revision 格式无效。");
+  }
+  return revision;
 }

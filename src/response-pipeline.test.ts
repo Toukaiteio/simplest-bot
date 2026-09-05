@@ -21,7 +21,7 @@ const pipeline = new ResponsePipeline({
     return segments;
   },
   parseTextSegments: (text) => [{ type: "text", data: { text } }],
-  sendSegments: async (_target, segments) => { sent.push(segments); },
+  sendSegments: async (_target, segments, _sourceText) => { sent.push(segments); },
   onAtMention: (_target, userId) => { mentions.push(userId); },
   maxTextChars: 5,
 });

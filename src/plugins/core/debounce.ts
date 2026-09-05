@@ -6,6 +6,7 @@ const DEFAULT_MAX_BATCH = 10;
 type BufferEntry = {
   messages: BotMessage[];
   timer: NodeJS.Timeout | null;
+  pendingWhileLocked: boolean;
 };
 
 export function createDebouncePlugin(
@@ -17,8 +18,10 @@ export function createDebouncePlugin(
   const buffers = new Map<string, BufferEntry>();
   const locks = new Map<string, boolean>();
 
-  function getKey(message: BotMessage): string {
-    return message.type === "group" ? `group:${message.groupId}` : `private:${message.userId}`;
+  function getKey(message: BotMessage, ctx: PluginContext): string {
+    const environment = ctx.getAgentEnvironment?.(message) ?? "restricted";
+    const conversation = message.type === "group" ? `group:${message.groupId}` : `private:${message.userId}`;
+    return `${conversation}:environment:${environment}`;
   }
 
   async function flush(key: string) {
@@ -53,7 +56,7 @@ export function createDebouncePlugin(
       if (triggerIndexes.length > 0) {
         // 触发判定只决定是否回复；同一 burst 的全部消息都交给上下文层。
         const triggerIndex = triggerIndexes[triggerIndexes.length - 1];
-        const reply = await handler.chatBatch(messages, triggerIndex);
+        const result = await handler.chatBatch(messages, triggerIndex);
 
         const triggerMessage = messages[triggerIndex];
         const target = triggerMessage.type === "group"
@@ -61,7 +64,9 @@ export function createDebouncePlugin(
           : { type: "private" as const, id: triggerMessage.userId! };
 
         const context = target.type === "group" ? { groupId: target.id } : undefined;
-        await handler.sendResponse(target, reply, context);
+        if (!result.delivered) {
+          await handler.sendResponse(target, result.text, context);
+        }
       }
     } catch (error) {
       console.error("[Debounce] 处理失败:", error);
@@ -69,9 +74,19 @@ export function createDebouncePlugin(
       locks.delete(key);
       const remaining = buffers.get(key);
       if (remaining && remaining.messages.length > 0) {
-        remaining.timer = setTimeout(() => {
-          void flush(key);
-        }, windowMs);
+        if (remaining.pendingWhileLocked) {
+          // Messages received during the active run already formed the next
+          // pending list. Insert them into the Agent loop immediately instead
+          // of waiting for another debounce window.
+          remaining.pendingWhileLocked = false;
+          setTimeout(() => {
+            void flush(key);
+          }, 0);
+        } else {
+          remaining.timer = setTimeout(() => {
+            void flush(key);
+          }, windowMs);
+        }
       } else if (remaining) {
         buffers.delete(key);
       }
@@ -86,14 +101,14 @@ export function createDebouncePlugin(
       handler = h;
     },
 
-    async onMessage(message: BotMessage): Promise<boolean> {
+    async onMessage(message: BotMessage, ctx: PluginContext): Promise<boolean> {
       if (message.text.startsWith(commandPrefix)) return false;
 
-      const key = getKey(message);
+      const key = getKey(message, ctx);
       let entry = buffers.get(key);
 
       if (!entry) {
-        entry = { messages: [], timer: null };
+        entry = { messages: [], timer: null, pendingWhileLocked: false };
         buffers.set(key, entry);
       }
 
@@ -101,7 +116,12 @@ export function createDebouncePlugin(
 
       if (entry.timer) clearTimeout(entry.timer);
 
-      if (locks.get(key)) return true;
+      if (locks.get(key)) {
+        // Keep trigger messages in a pending list while the current Agent
+        // loop is busy. The completed run will drain this list as one batch.
+        entry.pendingWhileLocked = true;
+        return true;
+      }
 
       if (entry.messages.length >= maxBatch) {
         void flush(key);

@@ -6,15 +6,21 @@
     "reconnectIntervalMs": 5000,
     "actionTimeoutMs": 10000
   },
+  "proxy": {
+    "enabled": true,
+    "mode": "system",
+    "url": "http://127.0.0.1:55268",
+    "noProxy": "localhost,127.0.0.1"
+  },
   "llm": {
     "name": "主力",
     "provider": "openai",
-    "baseUrl": "",
+    "baseUrl": "https://api.openai.com/v1",
     "apiKey": "sk-your-api-key",
     "model": "gpt-4o-mini",
     "temperature": 0.7,
     "maxTokens": 2048,
-    "systemPrompt": "你是一个友好的AI助手。请用中文回复，保持简洁。",
+    "systemPrompt": "你是一个面向实际工作的 AI Agent。请用中文，语言简练、干练，先给结论，再给必要细节。表达自然、克制，默认少用 emoji、颜文字、装饰性符号和连续标点；只有确实有助于表达语气时才少量使用。代码、命令、路径和必要的 Markdown 符号应保留。",
     "reasoningEffort": "low",
     "supportsImages": false,
     "supportsVideo": false,
@@ -29,7 +35,7 @@
       "model": "deepseek-chat",
       "temperature": 0.7,
       "maxTokens": 2048,
-      "systemPrompt": "你是一个友好的AI助手。请用中文回复，保持简洁。",
+      "systemPrompt": "你是一个面向实际工作的 AI Agent。请用中文，语言简练、干练，先给结论，再给必要细节。表达自然、克制，默认少用 emoji、颜文字、装饰性符号和连续标点；只有确实有助于表达语气时才少量使用。代码、命令、路径和必要的 Markdown 符号应保留。",
       "supportsImages": false,
       "supportsVideo": false,
       "supportsVoice": false
@@ -56,6 +62,7 @@
     "blacklist": true,
     "groupTrigger": true,
     "reply": true,
+    "chat": true,
     "atMention": true,
     "markdownImage": true,
     "fftImage": true,
@@ -66,11 +73,11 @@
     "browser": true,
     "dailyReport": true,
     "fileWorkspace": true,
-    "adminAssist": true,
     "todo": true,
     "mmorpgFramework": true,
     "moderation": false,
     "chatSearch": true,
+    "tts": false,
     "music": true,
     "flowmusic": false,
     "imgGen": true,
@@ -93,10 +100,32 @@
     "coreCommand": {
       "prefix": "$"
     },
+    "geminiRelay": {
+      "host": "127.0.0.1",
+      "port": 8081,
+      "defaultModel": "gemini-3.7-flash",
+      "cookieFile": "",
+      "xsrfToken": "",
+      "authUser": "",
+      "geminiBl": "boq_assistant-bard-web-server_20260716.08_p0",
+      "requestTimeoutSec": 180,
+      "retryAttempts": 3,
+      "retryDelaySec": 2,
+      "logRequests": true,
+      "temporaryChats": false,
+      "apiKeys": [],
+      "proxy": {
+        "enabled": true,
+        "mode": "custom",
+        "url": "http://127.0.0.1:55268",
+        "noProxy": "localhost,127.0.0.1"
+      }
+    },
     "fileWorkspace": {
       "rootDir": "data/chat-files",
       "expirationDays": 10,
-      "maxViewChars": 4000
+      "maxViewChars": 4000,
+      "sharedGroupWorkspace": false
     },
     "dailyReport": {
       "time": "00:00",
@@ -108,20 +137,22 @@
       "requireMention": true,
       "keywords": ["bot", "Bot"]
     },
-    "adminAssist": {
-      "mentionTimeoutSeconds": 30,
-      "activityLookbackMinutes": 15,
-      "activitySampleIntervalSeconds": 15,
-      "awayIdleThresholdSeconds": 120,
-      "maxSummarySegments": 5,
-      "steamApiKey": "",
-      "steamUserIds": {}
-    },
     "todo": {
       "dataFile": "data/todos.json",
       "maxItemsPerChat": 100,
       "schedulerLookaheadSeconds": 30,
       "defaultReminderPrefix": "[待办提醒]"
+    },
+    "tts": {
+      "baseUrl": "https://api.fish.audio",
+      "apiKey": "",
+      "model": "s2.1-pro-free",
+      "referenceId": "c5c17c9709384ba9a4b294662a2af0b1",
+      "format": "mp3",
+      "maxTextChars": 2000,
+      "timeoutMs": 60000,
+      "outputDir": "data/tts",
+      "voiceRegistryDataFile": "data/voice-message-map.json"
     },
     "animeGuessr": {
       "dataFile": "data/anime-characters.json",
@@ -158,17 +189,37 @@
       "logScores": true
     },
     "search": {
-      "defaultProvider": "default",
+      "defaultProvider": "duckduckgo",
+      "maxResults": 5,
+      "timeoutMs": 15000,
       "maxResultChars": 5000,
-      "providers": [
-        {
-          "name": "default",
-          "baseUrl": "https://api.openai.com/v1",
-          "apiKey": "",
-          "model": "gpt-4o",
-          "systemPrompt": "你是一个网络搜索助手。当用户提出问题时，你会进行网络搜索并返回准确、简洁的答案。请注明信息来源。"
-        }
-      ]
+      "tavily": {
+        "baseUrl": "https://api.tavily.com",
+        "apiKey": "",
+        "searchDepth": "basic",
+        "topic": "general",
+        "includeAnswer": true,
+        "includeRawContent": false,
+        "endpoints": []
+      },
+      "serper": {
+        "baseUrl": "https://google.serper.dev",
+        "apiKey": "",
+        "gl": "cn",
+        "hl": "zh-cn"
+      },
+      "duckduckgo": {
+        "baseUrl": "https://api.duckduckgo.com",
+        "region": "wt-wt",
+        "safeSearch": "moderate"
+      }
+    },
+    "codingTools": {
+      "workspaceRoot": "data/agent-workspaces",
+      "maxFileBytes": 131072,
+      "maxSearchResults": 1000,
+      "maxLinesPerFile": 2000,
+      "commandTimeoutMs": 30000
     },
     "browser": {
       "host": "127.0.0.1",
@@ -188,6 +239,7 @@
       "outputDir": "data/markdown-images",
       "format": "webp",
       "quality": 88,
+      "longTextThreshold": 450,
       "cleanupDelayMs": 120000
     },
     "fftImage": {

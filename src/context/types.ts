@@ -76,7 +76,7 @@ export type BuildContextOptions = {
   /** 全局/跨用户记忆 */
   globalMemories?: string[];
 
-  /** 动态追加的系统提示（如 AdminAssist 场景说明） */
+  /** 动态追加的场景或插件系统提示 */
   dynamicSystemAppends?: string[];
 
   /** 工具定义文本，放在 immutable system chunk 中 */
@@ -87,6 +87,12 @@ export type BuildContextOptions = {
 
   /** 持久化的对话历史，用于在首次构建上下文时填充 working chunks */
   conversationHistory?: HistoryMessage[];
+
+  /**
+   * 是否将本次上下文状态写入持久化存储。真实环境流只保留进程内状态，
+   * 避免把物理环境中的消息、路径或命令输出写入普通会话数据库。
+   */
+  persist?: boolean;
 };
 
 /** 对话历史消息（与 MemoryMessage 结构一致，避免 context 模块依赖 memory 模块） */

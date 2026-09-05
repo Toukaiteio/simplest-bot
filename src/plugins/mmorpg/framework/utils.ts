@@ -1,5 +1,7 @@
 import type { PluginContext } from "../../../types.js";
 import type { BotToolRegistration } from "../../../tooling.js";
+import type { PromptBuildInput } from "../../../types.js";
+import { getInputMessage } from "../../../security/access-control.js";
 
 /**
  * Pure utility helpers shared across the MMORPG framework.
@@ -33,11 +35,9 @@ export function ensureContext(ctx: PluginContext | null): PluginContext {
 }
 
 export function resolveInputUserId(
-  input: { mode: "single"; message: { userId?: string } } | { mode: "batch"; messages: Array<{ userId?: string }> }
+  input: PromptBuildInput,
 ): string | undefined {
-  return input.mode === "single"
-    ? input.message.userId
-    : input.messages[input.messages.length - 1]?.userId;
+  return getInputMessage(input).userId;
 }
 
 export function requireString(value: unknown, field: string): string {

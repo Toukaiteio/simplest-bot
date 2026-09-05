@@ -16,6 +16,8 @@ export type ToolExecuteResult =
       media?: ToolMediaAttachment[];
       /** 标记此结果为最终回复，跳过模型后续生成 */
       final?: boolean;
+      /** Internal delivery marker used when a tool has already sent a fallback response. */
+      deliveredText?: string;
     };
 
 export type BotToolRegistration = {

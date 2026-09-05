@@ -15,6 +15,7 @@ import {
 } from "../../persona/render.js";
 import type { SoftCoreField } from "../../persona/types.js";
 import { SOFT_CORE_FIELDS } from "../../persona/types.js";
+import { getInputMessage } from "../../security/access-control.js";
 
 /**
  * 人格自进化插件。
@@ -45,9 +46,7 @@ export function createPersonaPlugin(
     ].join("\n"),
 
     async onBuildSystemPrompt(input: PromptBuildInput) {
-      const message = input.mode === "single"
-        ? input.message
-        : input.messages[input.messages.length - 1];
+      const message = getInputMessage(input);
 
       const lines: string[] = [];
 

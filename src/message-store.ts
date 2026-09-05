@@ -7,8 +7,8 @@ import type { BotMessage, UserProfile, ItemDef } from "./types.js";
 
 export type MessageStoreRecord =
   | { kind: "inbound"; timestamp: number; message: BotMessage }
-  | { kind: "reply"; timestamp: number; message: BotMessage; response: string }
-  | { kind: "batch_reply"; timestamp: number; messages: BotMessage[]; response: string };
+  | { kind: "reply"; timestamp: number; message: BotMessage; response: string; botMessageId?: string }
+  | { kind: "batch_reply"; timestamp: number; messages: BotMessage[]; response: string; botMessageId?: string };
 
 type LegacyStoredMessage = {
   timestamp: number;
@@ -28,6 +28,7 @@ export type StoredConversationTurn = {
 export type QueryMessagesOptions = {
   userId?: string;
   groupId?: string;
+  type?: "private" | "group";
   keywords?: string[];
   startTime?: number;
   endTime?: number;
@@ -247,22 +248,24 @@ export class MessageStore {
     });
   }
 
-  appendReply(message: BotMessage, response: string) {
+  appendReply(message: BotMessage, response: string, botMessageId?: string) {
     this.insertRecord({
       kind: "reply",
       timestamp: Date.now(),
       message,
       response,
+      botMessageId,
     });
   }
 
-  appendBatchReply(messages: BotMessage[], response: string) {
+  appendBatchReply(messages: BotMessage[], response: string, botMessageId?: string) {
     if (messages.length === 0) return;
     this.insertRecord({
       kind: "batch_reply",
       timestamp: Date.now(),
       messages,
       response,
+      botMessageId,
     });
   }
 
@@ -307,8 +310,20 @@ export class MessageStore {
         display_name: null,
         is_bot: 1,
         record_kind: "reply",
-        message_id: null,
-        message_json: null,
+        message_id: record.botMessageId ?? null,
+        // 持久化可还原的 BotMessage（含 selfId + message_id），使引用回溯（findMessageById）
+        // 能识别"这是 bot 自己发的消息"并对图片/语音占位符做诚实降级，而不是编造。
+        message_json: record.botMessageId
+          ? safeStringify({
+            id: record.botMessageId,
+            type: msg.type,
+            selfId: msg.selfId,
+            userId: msg.selfId,
+            groupId: msg.groupId,
+            text: record.response,
+            raw: {},
+          } satisfies BotMessage)
+          : null,
       });
     } else {
       // batch_reply
@@ -337,8 +352,19 @@ export class MessageStore {
         display_name: null,
         is_bot: 1,
         record_kind: "batch_reply",
-        message_id: null,
-        message_json: null,
+        message_id: record.botMessageId ?? null,
+        // 同 reply：持久化可还原的 BotMessage（含 selfId + message_id），供引用回溯。
+        message_json: record.botMessageId
+          ? safeStringify({
+            id: record.botMessageId,
+            type: primary?.type ?? "group",
+            selfId: primary?.selfId,
+            userId: primary?.selfId,
+            groupId: primary?.groupId,
+            text: record.response,
+            raw: {},
+          } satisfies BotMessage)
+          : null,
       });
     }
   }
@@ -461,6 +487,11 @@ export class MessageStore {
     if (opts.groupId) {
       conditions.push("group_id = ?");
       params.push(opts.groupId);
+    }
+
+    if (opts.type) {
+      conditions.push("msg_type = ?");
+      params.push(opts.type);
     }
 
     if (!includeReplies && !opts.userId) {
@@ -606,6 +637,7 @@ export class MessageStore {
    */
   queryInteraction(userId: string, opts: {
     groupId?: string;
+    type?: "private" | "group";
     startTime?: number;
     endTime?: number;
     order?: "asc" | "desc";
@@ -617,13 +649,17 @@ export class MessageStore {
     const orderSql = (opts.order ?? "desc") === "asc" ? "ASC" : "DESC";
 
     const conditions: string[] = [
-      "(user_id = ? AND is_bot = 0) OR (user_id = ? AND is_bot = 1)",
+      "((user_id = ? AND is_bot = 0) OR (user_id = ? AND is_bot = 1))",
     ];
     const params: unknown[] = [userId, userId];
 
     if (opts.groupId) {
       conditions.push("group_id = ?");
       params.push(opts.groupId);
+    }
+    if (opts.type) {
+      conditions.push("msg_type = ?");
+      params.push(opts.type);
     }
     if (opts.startTime) {
       conditions.push("timestamp >= ?");

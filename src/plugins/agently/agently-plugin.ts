@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn, execSync } from "node:child_process";
 import type { MenuPlugin, Plugin, PluginContext } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
+import { getInputMessage } from "../../security/access-control.js";
 
 type AgentlyState = {
   authorized: boolean;
@@ -184,7 +185,7 @@ function makeMailSendTool(): BotToolRegistration {
       const authErr = checkAuth();
       if (authErr) return authErr;
 
-      const userId = input.mode === "single" ? input.message.userId : undefined;
+      const userId = getInputMessage(input).userId;
       const hasEmailArgs = args.to && (args.to as string[]).length > 0 && args.subject && args.body;
 
       // Phase 2: user confirmed → use stored ctk to complete send
@@ -388,7 +389,7 @@ function makeMailTrashTool(): BotToolRegistration {
       const authErr = checkAuth();
       if (authErr) return authErr;
 
-      const userId = input.mode === "single" ? input.message.userId : undefined;
+      const userId = getInputMessage(input).userId;
 
       // Phase 2: user confirmed
       if (args.user_confirmed && userId) {
@@ -577,7 +578,7 @@ export function createAgentlyPlugin(menuPlugin: MenuPlugin): Plugin & { getToolR
             "授权验证失败：" + msg.slice(0, 200),
           );
         }
-      });
+      }, { adminOnly: true });
     },
 
     getToolRegistrations(): BotToolRegistration[] {

@@ -1,4 +1,8 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { getBrowser, closeBrowser } from "../../browser/browser-manager.js";
 export { closeBrowser };
 
@@ -76,6 +80,84 @@ export async function screenshotHtml(
     });
   } finally {
     await page.close();
+  }
+}
+
+/**
+ * Render an HTML string to an image file via a real `file://` page.
+ *
+ * 与 screenshotHtml 的差别：把 html 写入临时文件后用 page.goto(file://) 加载，
+ * 而不是 setContent。这样页面能以相对 file:// 路径加载本地 CSS/JS/字体
+ * （KaTeX 的 katex.min.css 会通过相对路径引用 fonts/ 下的 woff2 字体，
+ * 用 setContent 时这些资源无法解析；browser-manager 已启用
+ * --allow-file-access-from-files，因此 file:// 页面可跨目录读取本地资源）。
+ * 加载完成后等待 document.fonts 就绪，避免截图时公式/字体尚未绘制到位。
+ */
+export async function screenshotHtmlFile(
+  html: string,
+  imagePath: string,
+  options?: { width?: number; format?: "png" | "webp"; quality?: number },
+): Promise<void> {
+  const format = options?.format ?? "png";
+  const quality = options?.quality ?? 85;
+
+  const tmpPath = path.join(os.tmpdir(), `md-render-${Date.now()}-${randomUUID().slice(0, 8)}.html`);
+  fs.writeFileSync(tmpPath, html, "utf8");
+
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    const wideViewportWidth = 1200;
+    await page.setViewport({ width: wideViewportWidth, height: 600, deviceScaleFactor: 2 });
+    await page.goto(pathToFileURL(tmpPath).href, { waitUntil: "load" });
+    // 等待字体与 KaTeX/SVG 等异步绘制完成，避免截图抓到未渲染或字体缺失的效果。
+    await page.evaluate(() => document.fonts?.ready).catch(() => {});
+
+    const contentBox = await page.evaluate(() => {
+      const container = document.querySelector(".sheet, .m, .mc, .bl, .tc, .pf, .gc") as HTMLElement | null;
+      if (container) {
+        const r = container.getBoundingClientRect();
+        return { x: Math.ceil(r.left), y: Math.ceil(r.top), width: Math.ceil(r.width), height: Math.ceil(r.height) };
+      }
+      const firstChild = document.body.firstElementChild as HTMLElement | null;
+      if (firstChild) {
+        const r = firstChild.getBoundingClientRect();
+        return { x: Math.ceil(r.left), y: Math.ceil(r.top), width: Math.ceil(r.width), height: Math.ceil(r.height) };
+      }
+      return {
+        x: 0,
+        y: 0,
+        width: Math.max(
+          document.body.scrollWidth,
+          document.body.offsetWidth,
+          document.documentElement.clientWidth,
+          document.documentElement.scrollWidth,
+          document.documentElement.offsetWidth,
+        ),
+        height: Math.max(
+          document.body.scrollHeight,
+          document.body.offsetHeight,
+          document.documentElement.clientHeight,
+          document.documentElement.scrollHeight,
+          document.documentElement.offsetHeight,
+        ),
+      };
+    });
+
+    await page.screenshot({
+      path: imagePath,
+      type: format,
+      ...(format === "webp" ? { quality } : {}),
+      clip: {
+        x: contentBox.x,
+        y: contentBox.y,
+        width: contentBox.width,
+        height: Math.max(contentBox.height, 100),
+      },
+    });
+  } finally {
+    await page.close();
+    fs.unlink(tmpPath, () => {});
   }
 }
 

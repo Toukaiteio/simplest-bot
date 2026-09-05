@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { BotToolRegistration } from "./tooling.js";
 import type { Browser, Page } from "puppeteer-core";
 import type { LLMClient } from "./llm.js";
+import type { AgentEnvironment, AgentIdentity } from "./security/access-control.js";
 
 // ==================== OneBot v11 类型 ====================
 
@@ -51,6 +52,17 @@ export const oneBotConfigSchema = z.object({
   actionTimeoutMs: z.number().int().positive().default(10000),
 });
 
+/**
+ * Global outbound HTTP proxy configuration. `system` first uses the standard
+ * proxy environment variables and falls back to `url` when they are absent.
+ */
+export const proxyConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  mode: z.enum(["system", "custom"]).default("system"),
+  url: z.string().url().default("http://127.0.0.1:55268"),
+  noProxy: z.string().default("localhost,127.0.0.1"),
+}).default({});
+
 export const llmConfigSchema = z.object({
   name: z.string().optional(),
   provider: z.enum(["openai", "deepseek", "ollama", "custom"]).default("openai"),
@@ -59,14 +71,21 @@ export const llmConfigSchema = z.object({
   model: z.string().default("gpt-4o-mini"),
   temperature: z.number().min(0).max(2).default(0.7),
   maxTokens: z.number().int().positive().default(2048),
-  systemPrompt: z.string().default("你是一个友好的AI助手。请用中文回复。"),
-  reasoningEffort: z.enum(["low", "medium", "high"]).optional(),
+  systemPrompt: z.string().default("你是一个面向实际工作的 AI Agent。请用中文，语言简练、干练，先给结论，再给必要细节。表达自然、克制，默认少用 emoji、颜文字、装饰性符号和连续标点；只有确实有助于表达语气时才少量使用。代码、命令、路径和必要的 Markdown 符号应保留。"),
+  reasoningEffort: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]).optional(),
   supportsImages: z.boolean().default(false),
   supportsVideo: z.boolean().default(false),
   supportsVoice: z.boolean().default(false),
   /** 模型上下文窗口大小（token）。用于计算压缩阈值，不同模型可配不同值 */
   contextWindow: z.number().int().positive().default(128000),
 });
+
+/**
+ * 思考/推理强度档位，与 @mariozechner/pi-agent-core 的 ThinkingLevel 对齐：
+ * `"off" | "minimal" | "low" | "medium" | "high" | "xhigh"`。
+ * 注意：`minimal`/`xhigh` 仅部分模型家族支持，请结合具体模型能力选择。
+ */
+export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export const memoryConfigSchema = z.object({
   enabled: z.boolean().default(true),
@@ -91,6 +110,7 @@ export const pluginsConfigSchema = z.object({
   blacklist: z.boolean().default(true),
   groupTrigger: z.boolean().default(true),
   reply: z.boolean().default(true),
+  chat: z.boolean().default(true),
   atMention: z.boolean().default(true),
   markdownImage: z.boolean().default(true),
   fftImage: z.boolean().default(true),
@@ -101,11 +121,13 @@ export const pluginsConfigSchema = z.object({
   browser: z.boolean().default(true),
   dailyReport: z.boolean().default(true),
   fileWorkspace: z.boolean().default(true),
-  adminAssist: z.boolean().default(true),
   todo: z.boolean().default(true),
   mmorpgFramework: z.boolean().default(true),
   moderation: z.boolean().default(false),
   chatSearch: z.boolean().default(true),
+  tts: z.boolean().default(false),
+  /** gemini-web2api 的 Node.js 内嵌重写：进程内 OpenAI 兼容纯文本通道（普通聊天模型来源）。 */
+  geminiRelay: z.boolean().default(false),
   music: z.boolean().default(true),
   flowmusic: z.boolean().default(false),
   imgGen: z.boolean().default(true),
@@ -146,21 +168,13 @@ export const pluginSettingsSchema = z.object({
     rootDir: z.string().default("data/chat-files"),
     expirationDays: z.number().int().min(1).max(365).default(10),
     maxViewChars: z.number().int().min(200).max(20000).default(4000),
+    /** 群聊临时文件默认按发送者隔离；仅在明确需要时开启群共享。 */
+    sharedGroupWorkspace: z.boolean().default(false),
   }).default({}),
   groupTrigger: z.object({
     enabled: z.boolean().default(true),
     requireMention: z.boolean().default(true),
     keywords: z.array(z.string()).default(["bot", "Bot"]),
-  }).default({}),
-  adminAssist: z.object({
-    adminUserIds: z.array(z.coerce.string()).default([]),
-    mentionTimeoutSeconds: z.number().int().min(3).max(300).default(30),
-    activityLookbackMinutes: z.number().int().min(1).max(120).default(15),
-    activitySampleIntervalSeconds: z.number().int().min(3).max(60).default(15),
-    awayIdleThresholdSeconds: z.number().int().min(30).max(1800).default(120),
-    maxSummarySegments: z.number().int().min(1).max(10).default(5),
-    steamApiKey: z.string().default(""),
-    steamUserIds: z.record(z.string(), z.string()).default({}),
   }).default({}),
   todo: z.object({
     dataFile: z.string().default("data/todos.json"),
@@ -206,22 +220,44 @@ export const pluginSettingsSchema = z.object({
     logScores: z.boolean().default(true),
   }).default({}),
   search: z.object({
+    /** tavily | serper | duckduckgo；保留 string 以兼容旧版 default 配置。 */
+    defaultProvider: z.string().default("duckduckgo"),
+    maxResults: z.number().int().min(1).max(20).default(5),
+    timeoutMs: z.number().int().positive().default(15000),
+    tavily: z.object({
+      baseUrl: z.string().url().default("https://api.tavily.com"),
+      apiKey: z.string().default(""),
+      searchDepth: z.enum(["basic", "advanced"]).default("basic"),
+      topic: z.enum(["general", "news", "finance"]).default("general"),
+      includeAnswer: z.boolean().default(true),
+      includeRawContent: z.boolean().default(false),
+      /** 追加的多个 Tavily 兼容端点：自动负载均衡与失败回退。 */
+      endpoints: z.array(z.object({
+        name: z.string().optional(),
+        baseUrl: z.string().url(),
+        apiKey: z.string().default(""),
+        enabled: z.boolean().optional(),
+      })).default([]),
+    }).default({}),
+    serper: z.object({
+      baseUrl: z.string().url().default("https://google.serper.dev"),
+      apiKey: z.string().default(""),
+      gl: z.string().default("cn"),
+      hl: z.string().default("zh-cn"),
+    }).default({}),
+    duckduckgo: z.object({
+      baseUrl: z.string().url().default("https://api.duckduckgo.com"),
+      region: z.string().default("wt-wt"),
+      safeSearch: z.enum(["strict", "moderate", "off"]).default("moderate"),
+    }).default({}),
+    /** 旧版“LLM 代理搜索”配置，仅为平滑读取旧配置保留，不再作为搜索实现。 */
     providers: z.array(z.object({
       name: z.string().min(1),
       baseUrl: z.string().url(),
       apiKey: z.string().default(""),
       model: z.string().default("gpt-4o"),
       systemPrompt: z.string().default("你是一个网络搜索助手。当用户提出问题时，你会进行网络搜索并返回准确、简洁的答案。请注明信息来源。"),
-    })).default([
-      {
-        name: "default",
-        baseUrl: "https://api.openai.com/v1",
-        apiKey: "",
-        model: "gpt-4o",
-        systemPrompt: "你是一个网络搜索助手。当用户提出问题时，你会进行网络搜索并返回准确、简洁的答案。请注明信息来源。",
-      },
-    ]),
-    defaultProvider: z.string().default("default"),
+    })).default([]),
     maxResultChars: z.number().int().positive().default(5000),
   }).default({}),
   browser: z.object({
@@ -242,7 +278,53 @@ export const pluginSettingsSchema = z.object({
     outputDir: z.string().default("data/markdown-images"),
     format: z.enum(["png", "webp"]).default("webp"),
     quality: z.number().int().min(60).max(100).default(88),
+    longTextThreshold: z.number().int().min(200).max(10000).default(450),
     cleanupDelayMs: z.number().int().positive().default(120000),
+  }).default({}),
+  chatAgent: z.object({
+    /** 任务开始且无首段正文时，追加到触发消息上的 emoji 回应编号（NapCat set_msg_emoji_like 的 QQ 表情 id）。170 ≈ 👀。 */
+    taskStartEmojiId: z.number().int().positive().default(170),
+    /** chat 层独立的 LLM 提供商配置（如进程内 gemini-web2api 纯文本通道）。standard 模式优先使用，失败回退全局 llm 提供商。 */
+    llm: llmConfigSchema.optional(),
+    /** 图片消息原文注册表数据文件：记录 bot 渲染成图片发送的原文，用于引用回溯（持久化，重启后仍可查）。 */
+    sentImageTextsDataFile: z.string().default("data/sent-image-texts.json"),
+  }).default({}),
+  /** gemini-web2api Node.js 内嵌重写（进程内 OpenAI 兼容纯文本通道）。 */
+  geminiRelay: z.object({
+    host: z.string().default("127.0.0.1"),
+    port: z.number().int().min(1).max(65535).default(8081),
+    /** 上游 Cookie 文件（单行 Cookie 串或 {"cookie","sapisid"} JSON）；留空匿名工作。 */
+    cookieFile: z.string().default(""),
+    xsrfToken: z.string().default(""),
+    authUser: z.string().default(""),
+    geminiBl: z.string().default("boq_assistant-bard-web-server_20260716.08_p0"),
+    defaultModel: z.string().default("gemini-3.6-flash"),
+    requestTimeoutSec: z.number().int().min(1).max(600).default(180),
+    retryAttempts: z.number().int().min(1).max(10).default(3),
+    retryDelaySec: z.number().int().min(0).max(60).default(2),
+    logRequests: z.boolean().default(true),
+    temporaryChats: z.boolean().default(false),
+    /** 非空时启用鉴权：Authorization Bearer / x-api-key / x-goog-api-key / ?key=。 */
+    apiKeys: z.array(z.string()).default([]),
+    /**
+     * 上游 gemini.google.com 的专用代理。未设置（undefined）时沿用全局 fetch
+     * （已被 configureGlobalProxy 包装）；设置后 relay 用独立 dispatcher，
+     * 与 bot 其它出站流量解耦（例如全局直连、而 Gemini 上游需要代理）。
+     */
+    proxy: proxyConfigSchema.optional(),
+  }).default({}),
+  tts: z.object({
+    /** Fish Audio API base URL; the plugin appends /v1/tts. */
+    baseUrl: z.string().url().default("https://api.fish.audio"),
+    apiKey: z.string().default(""),
+    model: z.string().min(1).default("s2.1-pro-free"),
+    referenceId: z.string().min(1).default("c5c17c9709384ba9a4b294662a2af0b1"),
+    format: z.enum(["mp3", "wav", "pcm", "opus"]).default("mp3"),
+    maxTextChars: z.number().int().min(1).max(10000).default(2000),
+    timeoutMs: z.number().int().min(1000).max(120000).default(60000),
+    outputDir: z.string().default("data/tts"),
+    /** 语音消息内容注册表数据文件：记录 bot 已发送的语音与其朗读文本，用于引用回溯。 */
+    voiceRegistryDataFile: z.string().default("data/voice-message-map.json"),
   }).default({}),
   fftImage: z.object({
     outputDir: z.string().default("data/fft-images"),
@@ -284,7 +366,8 @@ export const pluginSettingsSchema = z.object({
     maxBackstoryChars: z.number().int().positive().default(150),
   }).default({}),
   codingTools: z.object({
-    workspaceRoot: z.string().default("."),
+    /** 普通/管理员普通 Agent 的受限根目录；运行时还会按用户拆分子目录。 */
+    workspaceRoot: z.string().default("data/agent-workspaces"),
     maxFileBytes: z.number().int().positive().default(131072),
     maxSearchResults: z.number().int().positive().default(1000),
     maxLinesPerFile: z.number().int().positive().default(2000),
@@ -335,6 +418,7 @@ export const personaConfigSchema = z.object({
 
 export const botConfigSchema = z.object({
   oneBot: oneBotConfigSchema,
+  proxy: proxyConfigSchema,
   llm: llmConfigSchema,
   llmFallbacks: z.array(llmConfigSchema).default([]),
   memory: memoryConfigSchema,
@@ -348,6 +432,7 @@ export const botConfigSchema = z.object({
 });
 
 export type OneBotConfig = z.infer<typeof oneBotConfigSchema>;
+export type ProxyConfig = z.infer<typeof proxyConfigSchema>;
 export type LLMConfig = z.infer<typeof llmConfigSchema>;
 export type MemoryConfig = z.infer<typeof memoryConfigSchema>;
 export type AuthConfig = z.infer<typeof authConfigSchema>;
@@ -374,7 +459,7 @@ export type PluginContext = {
   config: BotConfig;
   sendMessage: (target: NotifyTarget, text: string) => Promise<void>;
   sendImage: (target: NotifyTarget, filePath: string, caption?: string) => Promise<void>;
-  sendVoice: (target: NotifyTarget, filePath: string) => Promise<void>;
+  sendVoice: (target: NotifyTarget, filePath: string) => Promise<string | undefined>;
   sendFile: (target: NotifyTarget, filePath: string, name?: string) => Promise<void>;
   replyText: (message: BotMessage, text: string) => Promise<void>;
   recallMessage: (messageId: string) => Promise<void>;
@@ -383,11 +468,41 @@ export type PluginContext = {
   getBrowser: () => Promise<Browser>;
   newPage: () => Promise<Page>;
   getUserFacts?: (userId: string) => Promise<string[]>;
+  getAgentIdentity?: (message: BotMessage) => AgentIdentity;
+  getAgentEnvironment?: (message: BotMessage) => AgentEnvironment;
+  getAgentSessionKey?: (message: BotMessage) => string;
 };
 
 export type PromptBuildInput =
-  | { mode: "single"; message: BotMessage }
-  | { mode: "batch"; messages: BotMessage[] };
+  | { mode: "single"; message: BotMessage; environment?: AgentEnvironment }
+  | { mode: "batch"; messages: BotMessage[]; triggerIndex?: number; environment?: AgentEnvironment };
+
+export type ChatDeliveryOptions = {
+  /** Quote the triggering message when the transport supports it. */
+  quote?: boolean;
+  /** Force this run's reply to be delivered as voice via send_voice_message_tts. */
+  voice?: boolean;
+  /**
+   * 会话模式：standard 标准 AI 助手（无工具、无工作协议，默认）；agent 工具工作代理。
+   * 会话上下文按路径独立维护：standard / voice（$voice）/ agent（$work、$agent-real）。
+   */
+  mode?: "standard" | "agent";
+  /**
+   * 内部回传通道：每条物理消息发送成功后回调其真实 message_id（可能多条）。
+   * chat 层用它把最终交付与真实 message_id 关联，随 ChatRunResult.deliveredMessageIds
+   * 返回给宿主做持久化（用户引用该消息时可回溯）。宿主 sendReply 需透传给渲染管线。
+   */
+  onSentMessageIds?: (messageIds: string[]) => void;
+};
+
+export type ChatRunResult = {
+  /** The text persisted as the assistant result for this run. */
+  text: string;
+  /** True when the chat agent already submitted the response to the transport. */
+  delivered: boolean;
+  /** 实际发出的 message_id（可能多条，如 图片+链接文本 两段）；未交付时为空。 */
+  deliveredMessageIds?: string[];
+};
 
 export type ResponseTransform = {
   segments: OneBotMessageSegment[];
@@ -430,7 +545,7 @@ export type GroupTriggerPlugin = Plugin & {
 // 防抖插件类型
 export type DebounceHandler = {
   shouldReplyCheck: (message: BotMessage) => Promise<boolean>;
-  chatBatch: (messages: BotMessage[], triggerIndex: number) => Promise<string>;
+  chatBatch: (messages: BotMessage[], triggerIndex: number) => Promise<ChatRunResult>;
   sendResponse: (target: NotifyTarget, text: string, context?: TransformContext) => Promise<void>;
 };
 

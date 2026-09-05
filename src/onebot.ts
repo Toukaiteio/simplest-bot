@@ -38,6 +38,8 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
   private botInfo: { userId: string; nickname: string } | null = null;
   /** 媒体文件本地路径缓存：fileId -> path */
   private mediaFileCache = new Map<string, string>();
+  /** 媒体文件远端 url 缓存：fileId -> url（get_image/get_record 等响应里常带 url 字段）。 */
+  private mediaFileUrlCache = new Map<string, string>();
 
   constructor(private readonly config: OneBotConfig) {
     super();
@@ -159,6 +161,12 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     return this.botInfo;
   }
 
+  /** 获取 bot 自身的 userId（QQ 号），用于识别"这条消息是不是 bot 自己发的"。 */
+  async getBotSelfId(): Promise<string> {
+    const info = await this.ensureBotInfo();
+    return info.userId;
+  }
+
   async sendImage(target: NotifyTarget, filePath: string, caption?: string) {
     const message: OneBotMessageSegment[] = [];
     if (caption?.trim()) message.push({ type: "text", data: { text: `${caption.trim()}\n` } });
@@ -166,9 +174,16 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     await this.sendSegments(target, message);
   }
 
-  async sendVoice(target: NotifyTarget, filePath: string) {
+  async sendVoice(target: NotifyTarget, filePath: string): Promise<string | undefined> {
     const message: OneBotMessageSegment[] = [{ type: "record", data: { file: filePath } }];
-    await this.sendSegments(target, message);
+    if (target.type === "group") {
+      const result = await this.sendAction("send_group_msg", { group_id: target.id, message });
+      const id = extractActionData(result).message_id;
+      return id != null ? String(id) : undefined;
+    }
+    const result = await this.sendAction("send_private_msg", { user_id: target.id, message });
+    const id = extractActionData(result).message_id;
+    return id != null ? String(id) : undefined;
   }
 
   async sendFile(target: NotifyTarget, filePath: string, name?: string) {
@@ -182,12 +197,44 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
     await this.sendSegments(target, message);
   }
 
-  async sendSegments(target: NotifyTarget, message: OneBotMessageSegment[]) {
+  async sendSegments(target: NotifyTarget, message: OneBotMessageSegment[]): Promise<string | void> {
     if (target.type === "group") {
-      await this.sendAction("send_group_msg", { group_id: target.id, message });
-      return;
+      const result = await this.sendAction("send_group_msg", { group_id: target.id, message });
+      const id = extractActionData(result)?.message_id;
+      // 必须 String()：NapCat 返回的 message_id 是数字，而入站 reply 段的 id 是字符串。
+      // JS Map 中数字键与字符串键不相等，不转换会导致"图片原文注册表登记后永远查不回"。
+      return id != null ? String(id) : undefined;
     }
-    await this.sendAction("send_private_msg", { user_id: target.id, message });
+    const result = await this.sendAction("send_private_msg", { user_id: target.id, message });
+    const id = extractActionData(result)?.message_id;
+    return id != null ? String(id) : undefined;
+  }
+
+  /**
+   * 给指定消息追加一个 emoji 回应（QQ 表情“贴纸”），用于标记“已开始处理”。
+   * NapCat 扩展动作 set_msg_emoji_like：message_id 为待回应消息，emoji_id 接受
+   * “字符串数组”或“单个字符串”（Union(Array(String), String)）。不同 NapCat 版本对
+   * 数组/单值支持不稳定，这里依次尝试两种写法以保证兼容；最终都失败才抛出（由调用方兜底）。
+   * emojiId 默认使用编号 135（⚙️/齿轮，常见表示“处理中”），可传入其他合法表情编号。
+   */
+  async setMsgEmojiLike(messageId: string, emojiId = 135): Promise<void> {
+    const id = String(messageId);
+    const emoji = String(emojiId);
+    const shapes: Array<Record<string, unknown>> = [
+      { message_id: id, emoji_id: [emoji] },
+      { message_id: id, emoji_id: emoji },
+      { message_id: id, emojiId: emoji },
+    ];
+    let lastError: unknown;
+    for (const params of shapes) {
+      try {
+        await this.sendAction("set_msg_emoji_like", params);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error("set_msg_emoji_like 所有 payload 变体均失败。");
   }
 
   async sendAction(action: string, params: Record<string, unknown>) {
@@ -387,14 +434,29 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
       const result = await this.sendAction(action, { file });
       const data = extractActionData(result);
       if (!data || typeof data !== "object") return null;
-      const path = (data as { file?: string }).file ?? (data as { path?: string }).path;
-      if (typeof path !== "string") return null;
+      const record = data as { file?: unknown; path?: unknown; url?: unknown };
+      const url = typeof record.url === "string" && record.url ? record.url : undefined;
+      if (url) this.mediaFileUrlCache.set(cacheKey, url);
+      const path = typeof record.file === "string" && record.file
+        ? record.file
+        : (typeof record.path === "string" ? record.path : undefined);
+      if (!path) return null;
       this.mediaFileCache.set(cacheKey, path);
       return path;
     } catch (error) {
       console.error(`[OneBot] ${action} 失败:`, error);
       return null;
     }
+  }
+
+  /** 获取媒体文件的远端 url（get_image/get_record 响应中的 url 字段），无则 null。 */
+  async getMediaFileUrl(action: string, file: string): Promise<string | null> {
+    const cacheKey = `${action}:${file}`;
+    const cached = this.mediaFileUrlCache.get(cacheKey);
+    if (cached) return cached;
+    // 触发一次查询：getMediaFile 会同时填充本地路径缓存与 url 缓存。
+    await this.getMediaFile(action, file);
+    return this.mediaFileUrlCache.get(cacheKey) ?? null;
   }
 
   async downloadFileToBase64(filePath: string): Promise<string | null> {
@@ -404,6 +466,22 @@ export class OneBotClient extends EventEmitter<OneBotEvents> {
       return buffer.toString("base64");
     } catch (error) {
       console.error(`[OneBot] 读取本地文件 ${filePath} 失败:`, error);
+      return null;
+    }
+  }
+
+  /** 下载远端 url 为 base64（识图兜底用：本地文件被清理/过期时，从 QQ 服务器拉取图片）。 */
+  async downloadUrlToBase64(url: string): Promise<string | null> {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.error(`[OneBot] 下载远端文件失败: HTTP ${response.status} ${url}`);
+        return null;
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return buffer.toString("base64");
+    } catch (error) {
+      console.error(`[OneBot] 下载远端文件失败: ${url}`, error);
       return null;
     }
   }

@@ -1,11 +1,11 @@
 import type {
   BotMessage,
+  BotConfig,
   MenuPlugin,
   Plugin,
-  PluginContext,
-  PromptBuildInput,
 } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
+import { getInputMessage, isAdminMessage } from "../../security/access-control.js";
 import type {
   MessageStore,
   ChatMessageRecord,
@@ -68,6 +68,98 @@ export function createChatSearchPlugin(
     return isNaN(ms) ? undefined : ms;
   }
 
+  type SearchScopeOptions = {
+    additionalUserIds?: string[];
+  };
+
+  /**
+   * Ordinary users may search only the conversation that triggered the agent.
+   * Administrators retain the existing cross-conversation search capability.
+   * The explicit `type` predicate is important for private chats: a user ID
+   * can appear in multiple group chats, so filtering by user alone is not a
+   * sufficient privacy boundary.
+   */
+  function applySearchScope(
+    message: BotMessage,
+    config: BotConfig,
+    opts: QueryMessagesOptions,
+    options: SearchScopeOptions = {},
+  ): QueryMessagesOptions {
+    if (isAdminMessage(message, config)) return opts;
+
+    if (message.type === "group") {
+      if (!message.groupId) throw new Error("权限不足：无法确定当前群聊。");
+      if (opts.groupId && opts.groupId !== message.groupId) {
+        throw new Error("权限不足：普通用户只能搜索当前群聊。");
+      }
+      return {
+        ...opts,
+        type: "group",
+        groupId: message.groupId,
+      };
+    }
+
+    if (!message.userId) throw new Error("权限不足：无法确定当前用户。");
+    if (opts.groupId) {
+      throw new Error("权限不足：普通用户不能从私聊访问群聊记录。");
+    }
+    const allowedUserIds = new Set([message.userId, ...(options.additionalUserIds ?? [])]);
+    if (opts.userId && !allowedUserIds.has(opts.userId)) {
+      throw new Error("权限不足：普通用户只能搜索当前私聊参与者。");
+    }
+    return {
+      ...opts,
+      type: "private",
+      userId: opts.userId ?? message.userId,
+    };
+  }
+
+  function applyInteractionScope(
+    message: BotMessage,
+    config: BotConfig,
+    userId: string,
+    groupId: string | undefined,
+  ): { groupId?: string; type?: "private" | "group" } {
+    if (isAdminMessage(message, config)) return { groupId };
+
+    if (message.type === "group") {
+      if (!message.groupId) throw new Error("权限不足：无法确定当前群聊。");
+      if (groupId && groupId !== message.groupId) {
+        throw new Error("权限不足：普通用户只能搜索当前群聊。");
+      }
+      return { groupId: message.groupId, type: "group" };
+    }
+
+    if (!message.userId || userId !== message.userId) {
+      throw new Error("权限不足：普通用户只能搜索当前私聊。");
+    }
+    if (groupId) {
+      throw new Error("权限不足：普通用户不能从私聊访问群聊记录。");
+    }
+    return { type: "private" };
+  }
+
+  function assertContextScope(
+    message: BotMessage,
+    config: BotConfig,
+    records: ChatMessageRecord[],
+  ): void {
+    if (isAdminMessage(message, config) || records.length === 0) return;
+
+    const visible = message.type === "group"
+      ? Boolean(message.groupId) && records.every((record) => record.type === "group" && record.groupId === message.groupId)
+      : Boolean(message.userId) && records.every((record) => record.type === "private" && record.userId === message.userId);
+    if (!visible) {
+      throw new Error("权限不足：普通用户只能查看当前私聊或当前群聊的上下文。");
+    }
+  }
+
+  let loadedConfig: BotConfig | null = null;
+  function getLoadedConfig(): BotConfig {
+    if (!loadedConfig) throw new Error("聊天搜索插件尚未加载。");
+    return loadedConfig;
+  }
+
   // ── $commands ───────────────────────────────────────────────────
 
   menuPlugin.registerCommand(
@@ -87,13 +179,13 @@ export function createChatSearchPlugin(
         else keywordArgs.push(a);
       }
       const keyword = keywordArgs.join(" ").trim() || undefined;
-      const opts: QueryMessagesOptions = {
+      const opts = applySearchScope(message, ctx.config, {
         userId,
         keywords: keyword ? [keyword] : undefined,
         order: "desc",
         limit: COMMAND_DEFAULT_LIMIT,
         offset,
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `用户${userId}${keyword ? `, 关键词: "${keyword}"` : ""}${offset ? `, 偏移: ${offset}` : ""}`;
       await ctx.replyText(message, formatResults(records, desc));
@@ -117,13 +209,13 @@ export function createChatSearchPlugin(
         else keywordArgs.push(a);
       }
       const keyword = keywordArgs.join(" ").trim() || undefined;
-      const opts: QueryMessagesOptions = {
+      const opts = applySearchScope(message, ctx.config, {
         groupId,
         keywords: keyword ? [keyword] : undefined,
         order: "desc",
         limit: COMMAND_DEFAULT_LIMIT,
         offset,
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `群${groupId}${keyword ? `, 关键词: "${keyword}"` : ""}${offset ? `, 偏移: ${offset}` : ""}`;
       await ctx.replyText(message, formatResults(records, desc));
@@ -146,13 +238,13 @@ export function createChatSearchPlugin(
         if (m) offset = Math.max(0, parseInt(m[1], 10));
         else groupId = a;
       }
-      const opts: QueryMessagesOptions = {
+      const opts = applySearchScope(message, ctx.config, {
         keywords: [keyword],
         groupId,
         order: "desc",
         limit: COMMAND_DEFAULT_LIMIT,
         offset,
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `关键词: "${keyword}"${groupId ? `, 群${groupId}` : ""}${offset ? `, 偏移: ${offset}` : ""}`;
       await ctx.replyText(message, formatResults(records, desc));
@@ -178,18 +270,21 @@ export function createChatSearchPlugin(
         }
       }
 
-      if (!groupId) {
+      if (message.type !== "group" || !message.groupId) {
         await ctx.replyText(message, "用法: $chat-history <群号> [数量] [offset=N]\n(在群内可直接使用，默认当前群)");
         return;
       }
-      const opts: QueryMessagesOptions = {
+
+      const opts = applySearchScope(message, ctx.config, {
         groupId,
         order: "desc",
         limit,
         offset,
-      };
+      });
       const records = messageStore.queryMessages(opts);
-      const desc = `群${groupId}, 最近 ${limit} 条${offset ? `, 偏移: ${offset}` : ""}`;
+      const desc = opts.groupId
+        ? `群${opts.groupId}, 最近 ${limit} 条${offset ? `, 偏移: ${offset}` : ""}`
+        : `当前私聊, 最近 ${limit} 条${offset ? `, 偏移: ${offset}` : ""}`;
       await ctx.replyText(message, formatResults(records, desc));
     },
   );
@@ -235,19 +330,20 @@ export function createChatSearchPlugin(
 
   const toolSearchUserMessages = makeTool(
     "search_user_messages",
-    "按QQ号搜索某用户在群聊和私聊中的历史消息。当需要回忆某用户之前说过什么、查找某用户的发言记录时使用此工具。",
+    "按QQ号搜索历史消息；普通用户仅限当前会话，管理员可跨会话。当需要回忆某用户之前说过什么时使用此工具。",
     {
       type: "object",
       properties: {
         userId: { type: "string", description: "用户的QQ号 (必填)" },
         keyword: { type: "string", description: "关键词过滤 (可选)" },
-        groupId: { type: "string", description: "限定搜索的群号 (可选, 不填则搜索所有群和私聊)" },
+        groupId: { type: "string", description: "限定搜索的群号（普通用户只能填当前群；管理员不填可跨会话）" },
         ...searchTimeParams,
       },
       required: ["userId"],
     },
-    async (args) => {
-      const opts: QueryMessagesOptions = {
+    async (args, input) => {
+      const message = getInputMessage(input);
+      const opts = applySearchScope(message, getLoadedConfig(), {
         userId: String(args.userId),
         groupId: args.groupId ? String(args.groupId) : undefined,
         keywords: args.keyword ? [String(args.keyword)] : undefined,
@@ -256,7 +352,7 @@ export function createChatSearchPlugin(
         order: resolveOrder(args.order),
         limit: clampLimit(args.limit),
         offset: clampOffset(args.offset),
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `用户${opts.userId}${opts.groupId ? ` 群${opts.groupId}` : ""}${opts.keywords?.[0] ? ` 关键词"${opts.keywords[0]}"` : ""}`;
       return formatResults(records, desc, opts.limit);
@@ -276,8 +372,9 @@ export function createChatSearchPlugin(
       },
       required: ["groupId"],
     },
-    async (args) => {
-      const opts: QueryMessagesOptions = {
+    async (args, input) => {
+      const message = getInputMessage(input);
+      const opts = applySearchScope(message, getLoadedConfig(), {
         groupId: String(args.groupId),
         userId: args.userId ? String(args.userId) : undefined,
         keywords: args.keyword ? [String(args.keyword)] : undefined,
@@ -286,7 +383,7 @@ export function createChatSearchPlugin(
         order: resolveOrder(args.order),
         limit: clampLimit(args.limit),
         offset: clampOffset(args.offset),
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `群${opts.groupId}${opts.userId ? ` 用户${opts.userId}` : ""}${opts.keywords?.[0] ? ` 关键词"${opts.keywords[0]}"` : ""}`;
       return formatResults(records, desc, opts.limit);
@@ -295,19 +392,20 @@ export function createChatSearchPlugin(
 
   const toolSearchChatKeyword = makeTool(
     "search_chat_keyword",
-    "在所有群聊和私聊中按关键词搜索消息。当需要查找提到某个话题、人名、事件的所有记录时使用此工具。",
+    "按关键词搜索消息；普通用户仅限当前会话，管理员可跨所有群聊和私聊。当需要查找某个话题、人名或事件时使用此工具。",
     {
       type: "object",
       properties: {
         keyword: { type: "string", description: "搜索关键词 (必填)" },
         userId: { type: "string", description: "限定某用户的消息 (可选)" },
-        groupId: { type: "string", description: "限定某个群 (可选, 不填则搜索所有聊天)" },
+        groupId: { type: "string", description: "限定某个群（普通用户只能填当前群；管理员不填可搜索所有聊天）" },
         ...searchTimeParams,
       },
       required: ["keyword"],
     },
-    async (args) => {
-      const opts: QueryMessagesOptions = {
+    async (args, input) => {
+      const message = getInputMessage(input);
+      const opts = applySearchScope(message, getLoadedConfig(), {
         keywords: [String(args.keyword)],
         userId: args.userId ? String(args.userId) : undefined,
         groupId: args.groupId ? String(args.groupId) : undefined,
@@ -316,7 +414,7 @@ export function createChatSearchPlugin(
         order: resolveOrder(args.order),
         limit: clampLimit(args.limit),
         offset: clampOffset(args.offset),
-      };
+      });
       const records = messageStore.queryMessages(opts);
       const desc = `关键词"${opts.keywords![0]}"${opts.groupId ? ` 群${opts.groupId}` : ""}${opts.userId ? ` 用户${opts.userId}` : ""}`;
       return formatResults(records, desc, opts.limit);
@@ -325,22 +423,22 @@ export function createChatSearchPlugin(
 
   const toolSearchMyMessages = makeTool(
     "search_my_messages",
-    "获取我自己最近在所有群聊或私聊中的发言记录。当需要回忆自己之前说过什么、检查自己的发言历史时使用。",
+    "获取 Bot 自己的发言记录；普通用户仅限当前会话，管理员可跨会话。当需要检查 Bot 之前说过什么时使用。",
     {
       type: "object",
       properties: {
-        groupId: { type: "string", description: "限定某个群 (可选, 不填则搜索所有聊天)" },
+        groupId: { type: "string", description: "限定某个群（普通用户只能填当前群；管理员不填可搜索所有聊天）" },
         ...searchTimeParams,
       },
       required: [],
     },
     async (args, input) => {
       // 从 input 获取 bot 的 selfId
-      const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+      const msg = getInputMessage(input);
       const selfId = msg.selfId ?? msg.userId;
       if (!selfId) return "无法确定 bot 的 ID。";
 
-      const opts: QueryMessagesOptions = {
+      const opts = applySearchScope(msg, getLoadedConfig(), {
         userId: selfId,
         groupId: args.groupId ? String(args.groupId) : undefined,
         includeReplies: false,
@@ -349,7 +447,7 @@ export function createChatSearchPlugin(
         order: resolveOrder(args.order),
         limit: clampLimit(args.limit),
         offset: clampOffset(args.offset),
-      };
+      }, { additionalUserIds: [selfId] });
       const records = messageStore.queryMessages(opts);
       const desc = `我的发言${opts.groupId ? ` 群${opts.groupId}` : " 所有聊天"}`;
       return formatResults(records, desc, opts.limit);
@@ -358,21 +456,28 @@ export function createChatSearchPlugin(
 
   const toolSearchInteraction = makeTool(
     "search_interaction",
-    "获取我与指定用户之间的互动消息（包括对方发的和我回复的），跨所有群聊和私聊。当需要了解与某用户的完整互动历史时使用。",
+    "获取 Bot 与指定用户之间的互动消息；普通用户仅限当前会话，管理员可跨所有群聊和私聊。当需要了解互动历史时使用。",
     {
       type: "object",
       properties: {
         userId: { type: "string", description: "对方的QQ号 (必填)" },
-        groupId: { type: "string", description: "限定某个群 (可选, 不填则搜索所有聊天)" },
+        groupId: { type: "string", description: "限定某个群（普通用户只能填当前群；管理员不填可搜索所有聊天）" },
         ...searchTimeParams,
       },
       required: ["userId"],
     },
-    async (args) => {
+    async (args, input) => {
+      const message = getInputMessage(input);
       const userId = String(args.userId);
       const usedLimit = clampLimit(args.limit);
+      const scope = applyInteractionScope(
+        message,
+        getLoadedConfig(),
+        userId,
+        args.groupId ? String(args.groupId) : undefined,
+      );
       const records = messageStore.queryInteraction(userId, {
-        groupId: args.groupId ? String(args.groupId) : undefined,
+        ...scope,
         startTime: parseISOTime(args.startTime as string | undefined),
         endTime: parseISOTime(args.endTime as string | undefined),
         order: resolveOrder(args.order),
@@ -396,13 +501,15 @@ export function createChatSearchPlugin(
       },
       required: ["messageId"],
     },
-    async (args) => {
+    async (args, input) => {
+      const message = getInputMessage(input);
       const messageId = String(args.messageId);
       const before = Math.max(0, Math.min(20, Math.round(typeof args.before === "number" ? args.before : 5)));
       const after = Math.max(0, Math.min(20, Math.round(typeof args.after === "number" ? args.after : 5)));
 
       const records = messageStore.getMessageContext(messageId, before, after);
       if (records.length === 0) return `未找到消息 ID "${messageId}" 或其上下文。`;
+      assertContextScope(message, getLoadedConfig(), records);
 
       // 标记目标消息
       const lines = records.map((rec) => {
@@ -422,6 +529,7 @@ export function createChatSearchPlugin(
     systemPromptAppend: [
       "[记忆系统]",
       "你拥有搜索历史聊天记录的能力。当用户提及过去发生的事情、之前说过的话、或任何需要回忆的场景时，你应主动使用搜索工具查找相关记录。",
+      "权限边界：普通用户只能搜索当前私聊或当前群聊；管理员可以按权限跨会话搜索。不要通过参数尝试访问其他用户或群聊。",
       "可用的搜索工具：",
       "- search_user_messages: 按QQ号搜索某用户的消息",
       "- search_group_messages: 搜索某群的聊天记录",
@@ -433,7 +541,9 @@ export function createChatSearchPlugin(
       "搜索结果中的 [id:xxx] 是消息ID，可用 get_message_context 查看完整上下文。",
     ].join("\n"),
 
-    onLoad() {},
+    onLoad(ctx) {
+      loadedConfig = ctx.config;
+    },
 
     getToolRegistrations() {
       return [

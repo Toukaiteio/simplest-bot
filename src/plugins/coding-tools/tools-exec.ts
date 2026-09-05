@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
 import { ToolError, Workspace } from "./workspace.js";
+import { runRestrictedCommand } from "./sandbox-shell.js";
 
 export function createExecToolRegistration(workspace: Workspace): any[] {
   const ws = workspace;
@@ -10,7 +10,7 @@ export function createExecToolRegistration(workspace: Workspace): any[] {
         type: "function",
         function: {
           name: "workspace_exec_command",
-          description: "在工作区目录中执行命令。仅限管理员使用。注意：此工具可在工作区中执行任意命令。",
+          description: "在当前用户隔离的受限 workspace 中执行一个受限命令。普通用户和管理员普通对话可用；禁止 shell 拼接、绝对路径、环境变量展开和未允许程序。管理员真实环境请使用 agent_real_exec_command。",
           parameters: {
             type: "object",
             properties: {
@@ -21,20 +21,11 @@ export function createExecToolRegistration(workspace: Workspace): any[] {
           },
         },
       },
-      execute: async (args: any, input: any) => {
-        const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
-        const userId = msg.userId;
-        // Admin check happens in the main plugin
+      execute: async (args: any, _input: any) => {
         const cmd = String(args.cmd ?? "");
         if (!cmd) throw new ToolError("INVALID_ARGUMENT", "cmd 是必需的");
-        const timeoutMs = Math.min(120000, Math.max(1000, Number(args.timeoutMs) || 30000));
-        try {
-          const output = execSync(cmd, { cwd: ws.root, encoding: "utf-8", timeout: timeoutMs, maxBuffer: 65536 });
-          const truncated = output.length > 64000;
-          return JSON.stringify({ exit_code: 0, stdout: truncated ? output.slice(0, 64000) + "\n... (输出截断) ..." : output, stderr: "", truncated });
-        } catch (e: any) {
-          return JSON.stringify({ exit_code: e.status || -1, stdout: e.stdout || "", stderr: e.stderr || e.message || "", error: e.message?.slice(0, 500) });
-        }
+        const timeoutMs = Math.min(30000, Math.max(1000, Number(args.timeoutMs) || 30000));
+        return runRestrictedCommand(cmd, ws.root, timeoutMs);
       },
     },
   ];

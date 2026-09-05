@@ -8,7 +8,7 @@ interface OneBotLike {
   sendSegments(
     target: { type: "group" | "private"; id: string },
     segments: Array<{ type: string; data: Record<string, unknown> }>,
-  ): Promise<void>;
+  ): Promise<string | void>;
 }
 
 // ── Data types ──────────────────────────────────────────────────────────────

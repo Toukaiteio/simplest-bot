@@ -3,6 +3,7 @@ dist/
 data/
 
 bot.config.json
+gemini-auth.json
 .env
 .env.local
 .env.*.local
@@ -13,3 +14,28 @@ bot.config.json
 
 .DS_Store
 Thumbs.db
+
+# IDE/Agent workspaces (user requested to hide)
+.workbuddy/
+.zcode/
+agents/
+
+# Debug and output files
+probe-proxy-out.txt
+tsc-out.txt
+tsc-result.txt
+
+# Progress/temp files
+scripts/.enrich-progress.json
+scripts/.fetch-expand-progress.json
+scripts/.fetch-progress.json
+scripts/.work-tags-progress.json
+
+# Binary executables
+scripts/synthid-remove/synthid-remove.exe
+scripts/realesrgan/realesrgan-ncnn-vulkan.exe
+scripts/realesrgan/*.dll
+
+# Raw data files
+scripts/character_images_raw.json
+scripts/id_tags_raw.js

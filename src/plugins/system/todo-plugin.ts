@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BotMessage, MenuPlugin, NotifyTarget, Plugin, PluginContext, PromptBuildInput } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
+import { getInputMessage } from "../../security/access-control.js";
 
 type TodoTriggerType = "delay" | "datetime" | "window";
 type TodoRecurrenceType = "once" | "interval" | "daily" | "weekly";
@@ -755,9 +756,7 @@ function resolveTarget(args: Record<string, unknown>, input: PromptBuildInput): 
 }
 
 function getTargetForInput(input: PromptBuildInput): NotifyTarget {
-  return input.mode === "single"
-    ? getTargetForMessage(input.message)
-    : getTargetForMessage(input.messages[input.messages.length - 1]);
+  return getTargetForMessage(getInputMessage(input));
 }
 
 function getTargetForMessage(message: BotMessage): NotifyTarget {
@@ -768,9 +767,7 @@ function getTargetForMessage(message: BotMessage): NotifyTarget {
 }
 
 function getInputCreatorUserId(input: PromptBuildInput): string | undefined {
-  return input.mode === "single"
-    ? input.message.userId
-    : input.messages[input.messages.length - 1]?.userId;
+  return getInputMessage(input).userId;
 }
 
 function isSameTarget(left: NotifyTarget, right: NotifyTarget): boolean {

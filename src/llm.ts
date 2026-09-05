@@ -1,12 +1,16 @@
+import { randomBytes } from "node:crypto";
 import { ChatOpenAI, type ChatOpenAICallOptions } from "@langchain/openai";
 import { HumanMessage, SystemMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
-import type { LLMConfig, BotMessage, PromptBuildInput, ProviderInfo } from "./types.js";
+import type { LLMConfig, ReasoningEffort, BotMessage, PromptBuildInput, ProviderInfo } from "./types.js";
+import type { AgentEnvironment } from "./security/access-control.js";
 import { MemoryManager, type MemoryMessage } from "./memory.js";
 import type { BotToolRegistration } from "./tooling.js";
 
 import { ContextManager } from "./context/context-manager.js";
 import type { BuildContextOptions, GroupContext } from "./context/types.js";
 import { sanitizeAssistantOutput } from "./response-sanitizer.js";
+import { getVoiceMessageText } from "./plugins/system/voice-message-registry.js";
+import { IMAGE_PLACEHOLDER_RE } from "./quoted-message.js";
 
 type ProviderEntry = {
   config: LLMConfig;
@@ -24,12 +28,14 @@ export class LLMClient {
   private contextManager: ContextManager;
   private tools: NonNullable<ChatOpenAICallOptions["tools"]> = [];
   private toolHandlers = new Map<string, BotToolRegistration["execute"]>();
+  private toolAccessFilter?: (toolName: string, input: PromptBuildInput) => boolean;
   private truncatedTexts = new Map<string, string>();
   private truncateThreshold: number;
   private resolveReferencedMessage?: (messageId: string) => Promise<BotMessage | null>;
   private resolveForwardMessage?: (forwardId: string) => Promise<string | null>;
   private resolveGroupContext?: (message: BotMessage) => Promise<GroupContext | null>;
   private resolveInteractionHistory?: (userId: string, limit: number) => Promise<string | null>;
+  private readonly realSessionNonce = randomBytes(8).toString("hex");
 
   constructor(
     config: LLMConfig,
@@ -76,7 +82,7 @@ export class LLMClient {
 
   private static createChatModelWithOverrides(
     config: LLMConfig,
-    overrides?: { maxTokens?: number; reasoningEffort?: "low" | "medium" | "high" },
+    overrides?: { maxTokens?: number; reasoningEffort?: ReasoningEffort },
   ): ChatOpenAI {
     const openaiConfig: Record<string, unknown> = {
       modelName: config.model,
@@ -93,9 +99,10 @@ export class LLMClient {
       openaiConfig.apiKey = config.apiKey;
     }
 
-    if (overrides?.reasoningEffort ?? config.reasoningEffort) {
-      (openaiConfig.modelKwargs as Record<string, unknown>).reasoning_effort =
-        overrides?.reasoningEffort ?? config.reasoningEffort;
+    const effort = overrides?.reasoningEffort ?? config.reasoningEffort;
+    // off / 未配置时不发送 reasoning_effort，交由上游使用默认行为。
+    if (effort && effort !== "off") {
+      (openaiConfig.modelKwargs as Record<string, unknown>).reasoning_effort = effort;
     }
 
     return new ChatOpenAI(openaiConfig);
@@ -103,7 +110,7 @@ export class LLMClient {
 
   async invokeWithCustomConfig(
     messages: (SystemMessage | HumanMessage | AIMessage)[],
-    options: { timeout?: number; maxTokens?: number; reasoningEffort?: "low" | "medium" | "high" },
+    options: { timeout?: number; maxTokens?: number; reasoningEffort?: ReasoningEffort },
   ): Promise<string> {
     const timeout = options.timeout ?? 300000;
     const result = await Promise.race([
@@ -129,6 +136,10 @@ export class LLMClient {
     this.toolHandlers = new Map(
       registrations.map((registration) => [getToolName(registration.definition), registration.execute])
     );
+  }
+
+  setToolAccessFilter(filter: (toolName: string, input: PromptBuildInput) => boolean): void {
+    this.toolAccessFilter = filter;
   }
 
   getTruncatedFullText(id: string): string | undefined {
@@ -171,6 +182,24 @@ export class LLMClient {
 
   getActiveProvider(): ProviderEntry {
     return this.providers[this.activeIndex];
+  }
+
+  /**
+   * Expose provider configuration to the pi-agent chat adapter. The adapter
+   * owns the conversation loop, while this class remains the source of truth
+   * for provider switching and fallback ordering.
+   */
+  getActiveConfig(): LLMConfig {
+    return this.providers[this.activeIndex].config;
+  }
+
+  getProviderConfigs(): LLMConfig[] {
+    const ordered: LLMConfig[] = [];
+    for (let offset = 0; offset < this.providers.length; offset += 1) {
+      if (!this.fallbackEnabled && offset > 0) break;
+      ordered.push(this.providers[(this.activeIndex + offset) % this.providers.length].config);
+    }
+    return ordered;
   }
 
   listProviders(): ProviderInfo[] {
@@ -266,13 +295,36 @@ export class LLMClient {
   }
 
   /**
+   * 用配置中的主线路（constructor 的第一个 provider）压缩历史。
+   * 这个入口故意不从当前 activeIndex 开始，也不切换 active provider，
+   * 用于启动时整理已有会话，避免“当前线路曾切到备用线路”改变压缩来源。
+   */
+  async summarizeHistoryWithPrimaryProvider(history: MemoryMessage[]): Promise<string> {
+    const primary = this.providers[0];
+    if (!primary) return "";
+
+    const historyText = history.map(m => `${m.role}: ${m.content}`).join("\n");
+    const prompt = `总结以下对话的关键信息（100字内）：\n${historyText}`;
+
+    try {
+      const response = await primary.model.invoke([new HumanMessage(prompt)]);
+      this.logUsage(response.usage_metadata);
+      return typeof response.content === "string" ? response.content : String(response.content);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`[LLM] 主线路历史压缩失败：${reason}`);
+      return "";
+    }
+  }
+
+  /**
    * 独立 LLM 查询：带 system prompt 的简单一问一答，不涉及对话历史/工具/上下文管理。
    * 适合插件需要让 LLM 做分析/推荐/分类等独立推理的场景。
    */
   async askLlm(
     systemPrompt: string,
     userPrompt: string,
-    options?: { maxTokens?: number; reasoningEffort?: "low" | "medium" | "high" },
+    options?: { maxTokens?: number; reasoningEffort?: ReasoningEffort },
   ): Promise<string> {
     try {
       if (options && (options.maxTokens || options.reasoningEffort)) {
@@ -302,7 +354,7 @@ export class LLMClient {
       description: string;
       parameters: Record<string, unknown>;
     },
-    options?: { maxTokens?: number; reasoningEffort?: "low" | "medium" | "high" },
+    options?: { maxTokens?: number; reasoningEffort?: ReasoningEffort },
   ): Promise<Record<string, unknown> | null> {
     try {
       const messages = [new SystemMessage(systemPrompt), new HumanMessage(userPrompt)];
@@ -341,13 +393,26 @@ export class LLMClient {
     }
   }
 
-  async chat(message: BotMessage, dynamicPromptAppends?: string[]): Promise<string> {
-    const memories = await this.memory.getRelevantMemories(message);
-    const sessionKey = this.getSessionKey(message);
-    const contextOptions = await this.buildContextOptions(message, memories, dynamicPromptAppends);
+  async chat(
+    message: BotMessage,
+    dynamicPromptAppends?: string[],
+    environment: AgentEnvironment = "restricted",
+    sessionKeyOverride?: string,
+  ): Promise<string> {
+    const memories = environment === "restricted"
+      ? await this.memory.getRelevantMemories(message)
+      : [];
+    const sessionKey = sessionKeyOverride ?? this.getSessionKey(message, environment);
+    const contextOptions = await this.buildContextOptions(
+      message,
+      memories,
+      dynamicPromptAppends,
+      environment === "restricted",
+    );
+    contextOptions.persist = environment === "restricted";
 
     // 仅在首次构建时注入对话历史，避免每次调用都查询
-    if (!this.contextManager.isSeeded(sessionKey)) {
+    if (environment === "restricted" && !this.contextManager.isSeeded(sessionKey)) {
       contextOptions.conversationHistory = this.memory.getConversationHistory(message);
     }
 
@@ -358,16 +423,18 @@ export class LLMClient {
 
     try {
       const content = sanitizeAssistantOutput(
-        await this.invokeWithTools(promptMessages, { mode: "single", message }, sessionKey),
+        await this.invokeWithTools(promptMessages, { mode: "single", message, environment }, sessionKey),
       );
 
-      this.contextManager.appendAssistantResponse(sessionKey, content);
-      this.memory.addMessage(message, content).catch(err =>
-        console.error("[LLM] 存储记忆失败:", err)
-      );
-      // 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应事实
-      if (message.userId) {
-        this.memory.processFactMentions(content, message.userId);
+      if (environment === "restricted") {
+        this.contextManager.appendAssistantResponse(sessionKey, content);
+        this.memory.addMessage(message, content).catch(err =>
+          console.error("[LLM] 存储记忆失败:", err)
+        );
+        // 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应事实
+        if (message.userId) {
+          this.memory.processFactMentions(content, message.userId);
+        }
       }
 
       return content;
@@ -375,21 +442,38 @@ export class LLMClient {
       console.error("[LLM] 调用失败:", error);
       const errMsg = "抱歉，我暂时无法回复，请稍后再试。";
       // 确保上下文中也有 assistant 回复，避免 workingChunks 中残留孤立触发消息
-      try { this.contextManager.appendAssistantResponse(sessionKey, errMsg); } catch {}
+      if (environment === "restricted") {
+        try { this.contextManager.appendAssistantResponse(sessionKey, errMsg); } catch {}
+      }
       return errMsg;
     }
   }
 
-  async chatBatch(messages: BotMessage[], dynamicPromptAppends?: string[], triggerIndex = messages.length - 1): Promise<string> {
+  async chatBatch(
+    messages: BotMessage[],
+    dynamicPromptAppends?: string[],
+    triggerIndex = messages.length - 1,
+    environment: AgentEnvironment = "restricted",
+    sessionKeyOverride?: string,
+  ): Promise<string> {
     if (messages.length === 0) return "";
 
     const primary = messages[Math.max(0, Math.min(triggerIndex, messages.length - 1))];
-    const memories = await this.memory.getRelevantMemories(primary);
-    const sessionKey = this.getSessionKey(primary);
-    const contextOptions = await this.buildBatchContextOptions(messages, memories, dynamicPromptAppends, triggerIndex);
+    const memories = environment === "restricted"
+      ? await this.memory.getRelevantMemories(primary)
+      : [];
+    const sessionKey = sessionKeyOverride ?? this.getSessionKey(primary, environment);
+    const contextOptions = await this.buildBatchContextOptions(
+      messages,
+      memories,
+      dynamicPromptAppends,
+      triggerIndex,
+      environment === "restricted",
+    );
+    contextOptions.persist = environment === "restricted";
 
     // 仅在首次构建时注入对话历史，避免每次调用都查询
-    if (!this.contextManager.isSeeded(sessionKey)) {
+    if (environment === "restricted" && !this.contextManager.isSeeded(sessionKey)) {
       contextOptions.conversationHistory = this.memory.getConversationHistory(primary);
     }
 
@@ -400,16 +484,18 @@ export class LLMClient {
 
     try {
       const content = sanitizeAssistantOutput(
-        await this.invokeWithTools(promptMessages, { mode: "batch", messages }, sessionKey),
+        await this.invokeWithTools(promptMessages, { mode: "batch", messages, triggerIndex, environment }, sessionKey),
       );
 
-      this.contextManager.appendAssistantResponse(sessionKey, content);
-      this.memory.addBatch(messages, content).catch(err =>
-        console.error("[LLM] 批量存储记忆失败:", err)
-      );
-      // 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应事实
-      if (primary?.userId) {
-        this.memory.processFactMentions(content, primary.userId);
+      if (environment === "restricted") {
+        this.contextManager.appendAssistantResponse(sessionKey, content);
+        this.memory.addBatch(messages, content).catch(err =>
+          console.error("[LLM] 批量存储记忆失败:", err)
+        );
+        // 扫描 AI 回复中的 [FACT:xxx] 标记，激活对应事实
+        if (primary?.userId) {
+          this.memory.processFactMentions(content, primary.userId);
+        }
       }
 
       return content;
@@ -417,7 +503,9 @@ export class LLMClient {
       console.error("[LLM] Batch 调用失败:", error);
       const errMsg = "抱歉，我暂时无法回复，请稍后再试。";
       // 确保上下文中也有 assistant 回复，避免 workingChunks 中残留孤立触发消息
-      try { this.contextManager.appendAssistantResponse(sessionKey, errMsg); } catch {}
+      if (environment === "restricted") {
+        try { this.contextManager.appendAssistantResponse(sessionKey, errMsg); } catch {}
+      }
       return errMsg;
     }
   }
@@ -441,16 +529,19 @@ export class LLMClient {
   private async buildContextOptions(
     message: BotMessage,
     memories: string[],
-    dynamicPromptAppends?: string[]
+    dynamicPromptAppends?: string[],
+    includeExternalContext = true,
   ): Promise<BuildContextOptions> {
-    const [referenceText, groupContext, forwardText, interactionHistory] = await Promise.all([
-      this.buildReferenceText(message),
-      this.resolveGroupContext?.(message) ?? null,
-      message.forwardId ? this.buildForwardText(message.forwardId) : Promise.resolve(""),
-      message.type === "private" && message.userId && this.resolveInteractionHistory
-        ? this.resolveInteractionHistory(message.userId, 8)
-        : Promise.resolve(null),
-    ]);
+    const [referenceText, groupContext, forwardText, interactionHistory] = includeExternalContext
+      ? await Promise.all([
+        this.buildReferenceText(message),
+        this.resolveGroupContext?.(message) ?? null,
+        message.forwardId ? this.buildForwardText(message.forwardId) : Promise.resolve(""),
+        message.type === "private" && message.userId && this.resolveInteractionHistory
+          ? this.resolveInteractionHistory(message.userId, 8)
+          : Promise.resolve(null),
+      ])
+      : ["", null, "", null] as const;
     const displayText = this.maybeTruncate(message.text, "current");
     const parts = [
       referenceText ? `[该消息引用了：${referenceText}]` : "",
@@ -486,6 +577,7 @@ export class LLMClient {
     memories: string[],
     dynamicPromptAppends?: string[],
     requestedTriggerIndex = messages.length - 1,
+    includeExternalContext = true,
   ): Promise<BuildContextOptions> {
     const triggerIndex = Math.max(0, Math.min(requestedTriggerIndex, messages.length - 1));
     const trigger = messages[triggerIndex];
@@ -494,10 +586,12 @@ export class LLMClient {
     for (let i = 0; i < messages.length; i += 1) {
       if (i === triggerIndex) continue;
       const m = messages[i];
-      const [referenceText, forwardText] = await Promise.all([
-        this.buildReferenceText(m),
-        m.forwardId ? this.buildForwardText(m.forwardId) : Promise.resolve(""),
-      ]);
+      const [referenceText, forwardText] = includeExternalContext
+        ? await Promise.all([
+          this.buildReferenceText(m),
+          m.forwardId ? this.buildForwardText(m.forwardId) : Promise.resolve(""),
+        ])
+        : ["", ""] as const;
       const displayText = this.maybeTruncate(m.text, `batch-${i + 1}`);
       const parts = [
         referenceText ? `[该消息引用了：${referenceText}]` : "",
@@ -512,13 +606,15 @@ export class LLMClient {
       });
     }
 
-    const [triggerReferenceText, groupContext, triggerForwardText] = await Promise.all([
-      this.buildReferenceText(trigger),
-      this.resolveGroupContext && messages.length > 0
-        ? this.resolveGroupContext(trigger)
-        : null,
-      trigger.forwardId ? this.buildForwardText(trigger.forwardId) : Promise.resolve(""),
-    ]);
+    const [triggerReferenceText, groupContext, triggerForwardText] = includeExternalContext
+      ? await Promise.all([
+        this.buildReferenceText(trigger),
+        this.resolveGroupContext && messages.length > 0
+          ? this.resolveGroupContext(trigger)
+          : null,
+        trigger.forwardId ? this.buildForwardText(trigger.forwardId) : Promise.resolve(""),
+      ])
+      : ["", null, ""] as const;
     const triggerDisplayText = this.maybeTruncate(trigger.text, `batch-${messages.length}`);
     const triggerParts = [
       triggerReferenceText ? `[该消息引用了：${triggerReferenceText}]` : "",
@@ -550,13 +646,27 @@ export class LLMClient {
 
     const referenced = await this.resolveReferencedMessage(message.replyToMessageId);
     if (!referenced) {
-      return `消息 ID ${message.replyToMessageId}（内容暂不可见）`;
+      return `消息 ID ${message.replyToMessageId}（内容暂不可见，无法读取。请如实告知用户，不要编造其内容）`;
     }
 
     const sender = referenced.userId ?? "unknown";
-    const baseText = referenced.text.length > 500
-      ? referenced.text.slice(0, 500) + "..."
-      : referenced.text;
+    // 若被引用的是 bot 自己发送的语音消息，用注册表中的实际朗读文本替换占位内容。
+    let referencedText = referenced.text;
+    if (referenced.id) {
+      const knownVoiceText = getVoiceMessageText(referenced.id);
+      if (knownVoiceText) {
+        referencedText = `[语音内容] ${knownVoiceText}`;
+      }
+    }
+    // bot 自己发送的图片型消息（markdown-image 把原文转图）且原文未登记：
+    // 必须如实说明无法读取，防止模型"假装看到"并编造内容。
+    const isFromBot = Boolean(referenced.selfId && referenced.selfId === referenced.userId);
+    if (isFromBot && IMAGE_PLACEHOLDER_RE.test(referencedText.trim())) {
+      return `${sender}（Bot 你自己）: 此前发送的一条图片消息，图片内的文字未登记、无法读取。请如实告知用户你无法查看图片内容，不要编造。`;
+    }
+    const baseText = referencedText.length > 500
+      ? referencedText.slice(0, 500) + "..."
+      : referencedText;
     const forwardText = referenced.forwardId
       ? await this.buildForwardText(referenced.forwardId)
       : "";
@@ -576,8 +686,11 @@ export class LLMClient {
     return content;
   }
 
-  private getSessionKey(message: BotMessage): string {
-    return message.type === "private" ? `private:${message.userId}` : `group:${message.groupId}`;
+  private getSessionKey(message: BotMessage, environment: AgentEnvironment = "restricted"): string {
+    const base = message.type === "private" ? `private:${message.userId}` : `group:${message.groupId}`;
+    return environment === "real"
+      ? `${base}:agent-real:process:${this.realSessionNonce}:user:${message.userId ?? "unknown"}`
+      : base;
   }
 
   private logUsage(metadata: unknown): void {
@@ -602,12 +715,35 @@ export class LLMClient {
     input: PromptBuildInput,
     sessionKey?: string
   ): Promise<string> {
-    const invokeOptions: ChatOpenAICallOptions | undefined = this.tools.length > 0
-      ? { tools: this.tools }
+    const availableTools = this.tools.filter((definition) => {
+      const toolName = getToolName(definition);
+      return this.toolAccessFilter?.(toolName, input) ?? true;
+    });
+    const invokeOptions: ChatOpenAICallOptions | undefined = availableTools.length > 0
+      ? { tools: availableTools }
       : undefined;
 
-    return this.callWithFallback(async (chatModel) => {
+    return this.callWithFallback(async (chatModel, entryName) => {
       const conversation = [...messages];
+
+      // 图片理解：当前用户消息/引用消息中的图片（OneBot image 段的 url），
+      // 仅在所选提供商支持图片时注入油标 HumanMessage，随对话一起发给模型。
+      // relay 的 messagesToPrompt 会把 image_url 收集为 ImagePart → Scotty 上传 → 织入 payload。
+      const provider = this.providers.find(p => p.name === entryName)
+        ?? this.getActiveProvider();
+      if (provider.config.supportsImages === true && conversation.length > 0) {
+        const imageParts = this.buildImageParts(input);
+        if (imageParts.length > 0) {
+          const imageMsg = new HumanMessage({
+            content: [
+              { type: "text", text: "[系统：本轮消息附带图片，请结合图片内容理解并回复]" },
+              ...imageParts.map(url => ({ type: "image_url", image_url: { url } })),
+            ],
+          });
+          // 放在 system/历史之后、工具循环之前，让模型感知这轮的用户附带图片。
+          conversation.splice(Math.min(1, conversation.length), 0, imageMsg);
+        }
+      }
 
       for (let round = 0; round < 6; round += 1) {
         const response = await chatModel.invoke(conversation, invokeOptions);
@@ -719,6 +855,34 @@ export class LLMClient {
     }
 
     return new HumanMessage({ content });
+  }
+
+  /**
+   * 从当前触发消息（单条）或 burst（批量）的 raw message 段中提取图片的对外 URL。
+   * 用于把用户直接发送/附带的图片转发给支持图片的模型（relay 会下载并上传）。
+   * 注：bot 自己渲染发送的图片是本地文件（无对外 url），不会在此返回；这些场景
+   * 依赖引用原文回退（sent-image-texts registry），避免重复理解本地产物。
+   */
+  private buildImageParts(input: PromptBuildInput): string[] {
+    const candidates: BotMessage[] = input.mode === "single"
+      ? [input.message]
+      : (input.mode === "batch" && Array.isArray(input.messages) ? input.messages : []);
+    const urls: string[] = [];
+    const seen = new Set<string>();
+
+    for (const message of candidates) {
+      const segments = Array.isArray(message.raw?.message) ? message.raw.message : null;
+      if (!segments) continue;
+      for (const segment of segments) {
+        if (!segment || segment.type !== "image") continue;
+        const url = segment.data?.url;
+        if (typeof url === "string" && url && !seen.has(url)) {
+          seen.add(url);
+          urls.push(url);
+        }
+      }
+    }
+    return urls;
   }
 
   private maybeTruncate(text: string, id: string): string {

@@ -9,6 +9,8 @@ import { LLMClient } from "./llm.js";
 import { PluginManager } from "./plugin.js";
 import { MessageStore } from "./message-store.js";
 import { ContextManager } from "./context/context-manager.js";
+import { registerSentImageText, lookupSentImageText, initSentImageTexts } from "./sent-image-texts.js";
+import { createQuotedMessageResolver } from "./quoted-message.js";
 
 // ========== 编译后 prompt 快照缓存（保证重启前后前缀一致） ==========
 const PROMPT_CACHE_FILE = "data/persona/compiled-prompt-cache.json";
@@ -57,7 +59,8 @@ import { createShopPlugin } from "./plugins/economy/shop-plugin.js";
 import { createRewardSystemPlugin } from "./plugins/economy/reward-system-plugin.js";
 import { createSystemPlugin } from "./plugins/system/system-plugin.js";
 import { createIdentityPlugin } from "./plugins/system/identity-plugin.js";
-import { createAdminAssistPlugin } from "./plugins/system/admin-assist-plugin.js";
+import { createAgentPolicyPlugin } from "./plugins/system/agent-policy-plugin.js";
+import { createAgentEnvironmentPlugin, type AgentEnvironmentPlugin } from "./plugins/system/agent-environment-plugin.js";
 import { createTodoPlugin } from "./plugins/system/todo-plugin.js";
 import { AGENT_PLAN_SYSTEM_PROMPT, createAgentPlanToolRegistrations } from "./plugins/system/agent-plan-tool.js";
 import { createChatSearchPlugin } from "./plugins/system/chat-search-plugin.js";
@@ -71,9 +74,19 @@ import { createNeteaseMusicPlugin } from "./plugins/music/netease-music-plugin.j
 import type { NeteaseMusicPlugin } from "./plugins/music/netease-music-plugin.js";
 import { createFileWorkspacePlugin } from "./plugins/system/file-workspace-plugin.js";
 import { createCodingToolsPlugin } from "./plugins/coding-tools/plugin.js";
+import { createAgentRealToolRegistrations } from "./plugins/system/agent-real-tools.js";
+import { createDesktopToolRegistrations } from "./plugins/system/desktop-tools.js";
+import { createVoiceTtsPlugin } from "./plugins/system/voice-tts-plugin.js";
+import { initVoiceMessageRegistry } from "./plugins/system/voice-message-registry.js";
 import { createWebFetchPlugin, webfetchToolRegistration } from "./plugins/webfetch.js";
 import { createSearchPlugin, searchToolRegistration } from "./plugins/search-plugin.js";
 import { createBrowserPlugin, browserToolRegistration } from "./plugins/browser-plugin.js";
+import {
+  CHAT_CONTEXT_CHAR_LIMIT,
+  createPiAgentChatPlugin,
+  type PiAgentChatPlugin,
+} from "./plugins/chat/pi-agent-chat-plugin.js";
+import { createGeminiWebRelayPlugin, type GeminiWebRelayPlugin } from "./network/gemini-relay/plugin.js";
 import { createMMORPGFrameworkPlugin } from "./plugins/mmorpg/framework-plugin.js";
 import { createMediaToolRegistrations } from "./media-tools.js";
 import { createMusicPlugin } from "./plugins/music/music-plugin.js";
@@ -91,8 +104,11 @@ import { EvolutionEngine } from "./persona/evolution-engine.js";
 import { renderGlobalStyle, renderSoftCore } from "./persona/render.js";
 import { makeTool } from "./plugins/mmorpg/framework/utils.js";
 import type { BotToolRegistration } from "./tooling.js";
+import { assertToolAccess, canUseTool, getAdminUserIds, getAgentIdentity, getInputMessage, isPrivilegedToolName } from "./security/access-control.js";
+import { AGENT_STABLE_WORK_PROMPT } from "./security/agent-prompt.js";
+import { configureGlobalProxy } from "./network/proxy.js";
 import type {
-  PluginContext, BotMessage,
+  PluginContext, BotMessage, ChatRunResult,
   BlacklistPlugin, GroupTriggerPlugin,
   DataStorePlugin, InventoryPlugin, MenuPlugin,
   SocialPlugin, CheckinPlugin, MentionTrackerPlugin, WelfareRewardSystemPlugin,
@@ -104,6 +120,7 @@ async function main() {
 
   const config = loadConfig();
   console.log("[Config] 配置已加载");
+  configureGlobalProxy(config.proxy);
 
   const messageStore = new MessageStore();
   process.on("exit", () => { messageStore.close(); closeBrowser(); });
@@ -114,7 +131,8 @@ async function main() {
   const onebot = new OneBotClient(config.oneBot);
 
   // ========== 人格自进化系统 ==========
-  // 先加载画像，把软核心 + 全局风格渲染进 ContextManager 的 immutable 人格层
+  // 先加载画像，把软核心 + 全局风格渲染出来；角色设定（persona）只注入语音会话（$voice），
+  // 不再追加进全局 systemPrompt（普通聊天与工作 Agent 均为中性提示）。
   const baseSystemPrompt = config.llm.systemPrompt;
   const personaStore = new PersonaStore(config.persona.dataDir, config.persona);
   let initialPersonaBlock = "";
@@ -125,15 +143,14 @@ async function main() {
     const cached = loadPromptCache();
     if (cached && cached.versionKey === currentVersionKey) {
       initialPersonaBlock = cached.personaBlock;
-      console.log(`[Persona] 从快照缓存恢复 prompt（version ${currentVersionKey}）`);
+      console.log(`[Persona] 从快照缓存恢复 persona（version ${currentVersionKey}）`);
     } else {
       initialPersonaBlock =
         `[你的性格画像]\n你的性格是：${renderSoftCore(personaStore.getSoftCore())}。` +
         `这是你跨所有场景一致的性格底色，会随长期互动缓慢成长，但不会轻易改变。\n\n` +
         renderGlobalStyle(personaStore.getGlobalStyle());
-      console.log(`[Persona] 软核心与全局风格已拼入 systemPrompt（version ${currentVersionKey}）`);
+      console.log(`[Persona] 软核心与全局风格已渲染（version ${currentVersionKey}，仅 $voice 注入）`);
     }
-    config.llm.systemPrompt += "\n\n" + initialPersonaBlock;
   }
 
   const pluginManager = new PluginManager();
@@ -149,6 +166,8 @@ async function main() {
     },
   });
 
+  let agentEnvironmentPlugin: AgentEnvironmentPlugin | null = null;
+  let chatAgentPlugin: PiAgentChatPlugin | null = null;
   const pluginContext: PluginContext = {
     config,
     sendMessage: async () => { throw new Error("插件上下文尚未就绪"); },
@@ -165,9 +184,18 @@ async function main() {
       if (!memory) return [];
       return memory.getUserFacts(userId);
     },
+    getAgentIdentity: (message) => getAgentIdentity(message, config),
+    getAgentEnvironment: (message) => agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted",
+    getAgentSessionKey: (message) => agentEnvironmentPlugin?.getSessionKey(message)
+      ?? getAgentIdentity(message, config).conversationKey,
   };
 
   pluginManager.setContext(pluginContext);
+
+  // This policy gate must run before moderation, commands and debounce so a
+  // refused/injection message never enters the Agent context or burst buffer.
+  const agentPolicyPlugin = createAgentPolicyPlugin();
+  pluginManager.register(agentPolicyPlugin);
 
   const moderationPlugin = createModerationPlugin(config.pluginSettings.moderation);
   if (config.plugins.moderation) {
@@ -183,6 +211,9 @@ async function main() {
 
   const menu: MenuPlugin = createMenuPlugin(coreCmd);
   pluginManager.register(menu);
+
+  agentEnvironmentPlugin = createAgentEnvironmentPlugin(menu);
+  pluginManager.register(agentEnvironmentPlugin);
 
   pluginManager.register(createTimePlugin());
 
@@ -207,6 +238,12 @@ async function main() {
   if (config.plugins.codingTools) {
     pluginManager.register(codingToolsPlugin);
   }
+  initVoiceMessageRegistry(config.pluginSettings.tts.voiceRegistryDataFile);
+  initSentImageTexts(config.pluginSettings.chatAgent.sentImageTextsDataFile);
+  const voiceTtsPlugin = createVoiceTtsPlugin();
+  if (config.plugins.tts) {
+    pluginManager.register(voiceTtsPlugin);
+  }
 
   // ========== 内置插件（根据配置启用） ==========
   const blacklistPlugin = createBlacklistPlugin(config.blacklist);
@@ -215,8 +252,7 @@ async function main() {
   const groupTriggerPlugin = createGroupTriggerPlugin();
   if (config.plugins.groupTrigger) pluginManager.register(groupTriggerPlugin);
 
-  const adminAssistPlugin = createAdminAssistPlugin(onebot, config.pluginSettings.adminAssist.adminUserIds);
-  if (config.plugins.adminAssist) pluginManager.register(adminAssistPlugin);
+  const configuredAdminUserIds = [...getAdminUserIds(config)];
   const todoPlugin = createTodoPlugin(menu);
   if (config.plugins.todo) pluginManager.register(todoPlugin);
   const imgGenPlugin: ImgGenPlugin = createImgGenPlugin(menu, onebot);
@@ -231,7 +267,7 @@ async function main() {
   const petPlugin = createPetPlugin(store, menu);
   if (config.plugins.mmorpgFramework) pluginManager.register(petPlugin);
 
-  pluginManager.register(createIdentityPlugin(onebot, menu, config.auth.adminUserIds));
+  pluginManager.register(createIdentityPlugin(onebot, menu, configuredAdminUserIds));
   // 人格自进化插件（注入群画像 + rapport + 管理员命令）。EvolutionEngine 稍后装配。
   let personaEngineRef: EvolutionEngine | null = null;
   if (config.persona.enabled) {
@@ -325,6 +361,7 @@ async function main() {
   // 与性格画像无关、进化后也不应改变的后缀（插件追加 + 媒体说明）
   const systemPromptNonPersonaSuffix = [pluginAppendBlock, mediaAppendBlock].filter(Boolean).join("\n\n");
   const initialPersonaContent = [
+    AGENT_STABLE_WORK_PROMPT,
     baseSystemPrompt,
     ...(initialPersonaBlock ? [initialPersonaBlock] : []),
     ...(systemPromptNonPersonaSuffix ? [systemPromptNonPersonaSuffix] : []),
@@ -363,7 +400,15 @@ async function main() {
   }
 
   // system 插件需要 ContextManager 来清理持久化上下文状态
-  const systemPlugin = createSystemPlugin(memory, pluginManager, blacklistPlugin, groupTriggerPlugin, menu, contextManager);
+  const systemPlugin = createSystemPlugin(
+    memory,
+    pluginManager,
+    blacklistPlugin,
+    groupTriggerPlugin,
+    menu,
+    contextManager,
+    () => chatAgentPlugin,
+  );
   pluginManager.register(systemPlugin);
   await pluginManager.loadOne(systemPlugin);
 
@@ -375,6 +420,7 @@ async function main() {
         `这是你跨所有场景一致的性格底色，会随长期互动缓慢成长，但不会轻易改变。\n\n` +
         renderGlobalStyle(personaStore.getGlobalStyle());
       const refreshedPersonaContent = [
+        AGENT_STABLE_WORK_PROMPT,
         baseSystemPrompt,
         ...(refreshedPersonaBlock ? [refreshedPersonaBlock] : []),
         ...(systemPromptNonPersonaSuffix ? [systemPromptNonPersonaSuffix] : []),
@@ -398,6 +444,20 @@ async function main() {
     contextManager,
     config.contextManagement.maxMessageChars,
     async (messageId) => {
+      // 优先：该消息若是 bot 自己发送的"图片型消息"（markdown-image 等把原文转图），
+      // 直接还原为生成它的原文文本，避免 AI 只看到 `[图片 file=...]` 占位符。
+      const registered = lookupSentImageText(messageId);
+      if (registered) {
+        return {
+          id: messageId,
+          type: registered.type,
+          selfId: registered.userId,
+          userId: registered.userId,
+          groupId: registered.groupId,
+          text: registered.text,
+          raw: { post_type: "message", message_type: registered.type, message_id: messageId } as never,
+        };
+      }
       const local = messageStore.findMessageById(messageId);
       if (local) return local;
       return onebot.getMessage(messageId);
@@ -590,11 +650,27 @@ async function main() {
     },
   });
 
-  // 设置智能压缩回调
-  memory.setCompressCallback((history) => llm.summarizeHistory(history));
+  // 设置智能压缩回调：历史上下文整理固定使用配置中的主线路，
+  // 不受运行期间 provider use 切换到备用线路的影响。
+  memory.setCompressCallback((history) => llm.summarizeHistoryWithPrimaryProvider(history));
+
+  // 启动时整理已有的超长标准会话。历史预算比 Relay 硬上限再小一些，
+  // 给 standard systemPrompt、当前消息和 Relay 角色前缀留出空间；该操作
+  // 只会处理超限快照，后续启动不会重复请求主线路。
+  const persistedCompaction = await memory.compactPersistedConversationsForContext(
+    Math.max(0, CHAT_CONTEXT_CHAR_LIMIT - 2_800),
+  );
+  if (persistedCompaction.compressed > 0 || persistedCompaction.failed > 0) {
+    console.log(
+      `[Memory] 启动历史整理：检查 ${persistedCompaction.checked} 个会话，` +
+      `压缩 ${persistedCompaction.compressed} 个，失败 ${persistedCompaction.failed} 个，` +
+      `字符 ${persistedCompaction.beforeChars}→${persistedCompaction.afterChars}`,
+    );
+  }
 
   // 注册工具
   const toolRegistrations: BotToolRegistration[] = [];
+  toolRegistrations.push(...agentPolicyPlugin.getToolRegistrations());
   toolRegistrations.push(...createAgentPlanToolRegistrations());
   toolRegistrations.push(...social.getToolRegistrations());
   if (config.plugins.fileWorkspace) {
@@ -604,40 +680,44 @@ async function main() {
     toolRegistrations.push(...codingToolsPlugin.getToolRegistrations());
     console.log(`[CodingTools] 已注册工作区级读写工具`);
   }
+  if (config.plugins.tts) {
+    toolRegistrations.push(...voiceTtsPlugin.getToolRegistrations());
+  }
   if (config.plugins.webfetch) {
     toolRegistrations.push(webfetchToolRegistration);
   }
   if (config.plugins.search) {
-    toolRegistrations.push(
-      searchToolRegistration(config.pluginSettings.search, (target, text) => {
-        const context = target.type === "group" ? { groupId: target.id } : undefined;
-        return responsePipeline.send(target, text, { context });
-      })
-    );
+    toolRegistrations.push(searchToolRegistration(config.pluginSettings.search));
   }
   if (config.plugins.browser) {
-    toolRegistrations.push(
-      browserToolRegistration(
-        config.pluginSettings.browser,
-        config.llm,
-        (input) => {
-          const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
-          const baseDir = path.resolve(process.cwd(), config.pluginSettings.fileWorkspace.rootDir);
-          if (msg.type === "group" && msg.groupId) {
-            const dir = path.join(baseDir, "group", msg.groupId);
-            fs.mkdirSync(dir, { recursive: true });
-            return dir;
-          }
-          const dir = path.join(baseDir, "private", msg.userId ?? "unknown");
+    const browserRegistration = browserToolRegistration(
+      config.pluginSettings.browser,
+      config.llm,
+      (input) => {
+        const msg = getInputMessage(input);
+        const baseDir = path.resolve(process.cwd(), config.pluginSettings.fileWorkspace.rootDir);
+        if (msg.type === "group" && msg.groupId && config.pluginSettings.fileWorkspace.sharedGroupWorkspace) {
+          const dir = path.join(baseDir, "group", msg.groupId);
           fs.mkdirSync(dir, { recursive: true });
           return dir;
         }
-      )
+        if (msg.type === "group" && msg.groupId) {
+          const dir = path.join(baseDir, "group", msg.groupId, "user", msg.userId ?? "anonymous");
+          fs.mkdirSync(dir, { recursive: true });
+          return dir;
+        }
+        const dir = path.join(baseDir, "private", msg.userId ?? "unknown");
+        fs.mkdirSync(dir, { recursive: true });
+        return dir;
+      }
     );
-  }
-  if (config.plugins.adminAssist) {
-    adminAssistPlugin.setTruncationProvider(llm);
-    toolRegistrations.push(...adminAssistPlugin.getToolRegistrations());
+    toolRegistrations.push({
+      ...browserRegistration,
+      execute: async (args, input) => {
+        assertToolAccess("browser_agent", input, config);
+        return browserRegistration.execute(args, input);
+      },
+    });
   }
   toolRegistrations.push(...contextManager.getToolRegistrations());
   if (config.plugins.todo) {
@@ -652,6 +732,8 @@ async function main() {
   if (agentlyPlugin) {
     toolRegistrations.push(...agentlyPlugin.getToolRegistrations());
   }
+  toolRegistrations.push(...createAgentRealToolRegistrations(config));
+  toolRegistrations.push(...createDesktopToolRegistrations(config));
   toolRegistrations.push(
     ...createMediaToolRegistrations(onebot, {
       supportsImages: config.llm.supportsImages,
@@ -676,7 +758,7 @@ async function main() {
           required: ["facts"],
         },
         async (args, input) => {
-          const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+           const msg = getInputMessage(input);
           const userId = msg.userId;
           const facts = args.facts;
           if (!userId || !Array.isArray(facts) || facts.length === 0) {
@@ -711,7 +793,7 @@ async function main() {
           required: ["query"],
         },
         async (args, input) => {
-          const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+           const msg = getInputMessage(input);
           const userId = msg.userId;
           const query = String(args.query ?? "").trim();
           const limit = Math.min(20, Math.max(1, Number(args.limit) || 10));
@@ -726,16 +808,55 @@ async function main() {
       )
     );
   }
-  if (toolRegistrations.length > 0) {
-    llm.setTools(toolRegistrations);
-    console.log(`[LLM] 已注册 ${toolRegistrations.length} 个工具`);
+  // Apply one final authorization boundary to every execution path. Individual
+  // plugins may also guard themselves, but tool descriptions are not access
+  // control and the legacy LangChain path must be protected too.
+  const guardedToolRegistrations = toolRegistrations.map((registration) => {
+    const definition = registration.definition as unknown as { function?: { name?: string } };
+    const toolName = definition.function?.name ?? "unknown_tool";
+    if (!isPrivilegedToolName(toolName)) return registration;
+    return {
+      ...registration,
+      execute: async (args: Record<string, unknown>, input: import("./types.js").PromptBuildInput) => {
+        assertToolAccess(toolName, input, config);
+        return registration.execute(args, input);
+      },
+    };
+  });
+
+  if (guardedToolRegistrations.length > 0) {
+    llm.setTools(guardedToolRegistrations);
+    llm.setToolAccessFilter((toolName, input) => canUseTool(toolName, input, config));
+    console.log(`[LLM] 已注册 ${guardedToolRegistrations.length} 个工具`);
   }
 
   const responsePipeline = new ResponsePipeline({
     splitResponse: (text) => pluginManager.splitResponse(text),
     transformResponse: (text, context) => pluginManager.transformResponse(text, context),
     parseTextSegments: safeCqToSegments,
-    sendSegments: (target, segments) => onebot.sendSegments(target, segments),
+    sendSegments: async (target, segments, sourceText) => {
+      const sentId = await onebot.sendSegments(target, segments);
+      // 若发送的是图片型消息，登记"图片消息 id ↔ 原文"，供后续引用时还原为文本。
+      if (sentId && sourceText && segments.some((s) => s.type === "image")) {
+        let botSelfId: string | undefined;
+        try { botSelfId = await onebot.getBotSelfId(); } catch { /* ignore */ }
+        const registered = registerSentImageText(sentId, {
+          text: sourceText,
+          userId: botSelfId,
+          groupId: target.type === "group" ? target.id : undefined,
+          type: target.type,
+          relTarget: target,
+        });
+        // 冷启动修复：跨重启登记的条目注册表里没有 selfId（旧数据 / 当时 getLoginInfo 失败），
+        // 此处异步补齐，保证 lookupSentImageText 命中时能构造完整 BotMessage。
+        if (registered && !registered.userId) {
+          void onebot.getBotSelfId()
+            .then((selfId) => { registered.userId = selfId; })
+            .catch(() => {});
+        }
+      }
+      return sentId ?? undefined;
+    },
     splitLongText,
     onAtMention: (target, userId, sourceText) => {
       if (target.type === "group") mentionTrackerPlugin.trackMention(userId, target.id, sourceText);
@@ -769,22 +890,139 @@ async function main() {
     }
   };
 
+  // Chat is a capability plugin: it owns the agent loop, session queue and
+  // explicit final-delivery tool, while this layer supplies the transport.
+  chatAgentPlugin = config.plugins.chat
+    ? createPiAgentChatPlugin({
+      config,
+      memory,
+      llm,
+      chatLlm: config.pluginSettings.chatAgent.llm,
+      personaPrompt: initialPersonaBlock,
+      // standard（普通聊天）通道不传人格、长期记忆或工作设定；历史超限后由
+      // chat 插件按字符预算注入压缩摘要（人格与工作协议仍仅保留在 voice/agent 通道）。
+      systemPrompt: "",
+      getDynamicPromptAppends: (input) => pluginManager.buildDynamicPromptAppends(input),
+      getAgentEnvironment: (message) => agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted",
+      getAgentSessionKey: (message) => agentEnvironmentPlugin?.getSessionKey(message)
+        ?? getAgentIdentity(message, config).conversationKey,
+      sendReply: (message, text, options) => sendReply(message, text, options),
+      resolveQuotedMessage: createQuotedMessageResolver({
+        findMessageById: (messageId) => messageStore.findMessageById(messageId),
+        getMessage: async (messageId) => onebot.getMessage(messageId),
+        getImageFile: (fileId) => onebot.getImageFile(fileId),
+        downloadFileToBase64: (filePath) => onebot.downloadFileToBase64(filePath),
+        getMediaFileUrl: (action, fileId) => onebot.getMediaFileUrl(action, fileId),
+        downloadUrlToBase64: (url) => onebot.downloadUrlToBase64(url),
+      }),
+          sendReaction: (message, emojiId) => {
+            if (!message.id) return Promise.resolve();
+            return onebot.setMsgEmojiLike(message.id, emojiId ?? config.pluginSettings.chatAgent.taskStartEmojiId);
+          },
+    })
+    : null;
+  if (chatAgentPlugin) {
+    chatAgentPlugin.setToolRegistrations(guardedToolRegistrations);
+    pluginManager.register(chatAgentPlugin);
+    await pluginManager.loadOne(chatAgentPlugin);
+  }
+
+  // 聊天模式命令：$voice（语音会话，注入角色设定 + 强制语音交付）与 $work（工作 Agent，
+  // 带工具与工作协议）。普通聊天为默认 standard 模式；三条路径（standard/voice/agent）
+  // 的会话上下文各自独立。语音不再由 chat 层自动触发。
+  if (chatAgentPlugin) {
+    const chatModeCommandsPlugin: import("./types.js").Plugin = {
+      name: "chat-mode-commands",
+      description: "$voice / $work 聊天模式命令",
+      onLoad() {
+        const prefix = menu.getPrefix();
+        menu.registerCommand(
+          "voice",
+          `语音聊天：${prefix}voice <内容>（AI 以角色设定生成适合朗读的口语回复，并用语音消息发送）`,
+          async (message, args, ctx) => {
+            const content = args.join(" ").trim();
+            if (!content) {
+              await ctx.replyText(message, `用法：${prefix}voice <内容>\n例如：${prefix}voice 讲个冷笑话`);
+              return;
+            }
+            const voiceDirective = [
+              "[$voice 命令指令]",
+              `用户通过 ${prefix}voice 命令提问：“${content}”。`,
+              "请认真回答这个问题。本轮回复已强制以语音交付，请面向朗读组织内容：短句、口语化、标准标点，不要包含链接、代码、命令路径或长表格。",
+            ].join("\n");
+            await chatAgentPlugin.chat(message, [voiceDirective], { mode: "agent", voice: true, quote: true });
+          },
+        );
+        menu.registerCommand(
+          "work",
+          `工作执行：${prefix}work <任务>（AI 使用工具实际完成任务，并以消息交付结果）`,
+          async (message, args, ctx) => {
+            const content = args.join(" ").trim();
+            if (!content) {
+              await ctx.replyText(message, `用法：${prefix}work <任务>\n例如：${prefix}work 修复项目里的一个 bug`);
+              return;
+            }
+            const workDirective = [
+              "[$work 命令指令]",
+              `用户通过 ${prefix}work 命令请求工作：“${content}”。`,
+              "这是明确的工作请求：使用可用工具实际完成任务，按工作协议用 send_current_reply 交付结果，不要只给出建议。",
+            ].join("\n");
+            await chatAgentPlugin.chat(message, [workDirective], { mode: "agent", quote: true });
+          },
+        );
+      },
+    };
+    pluginManager.register(chatModeCommandsPlugin);
+    await pluginManager.loadOne(chatModeCommandsPlugin);
+  }
+
+  // Gemini Web 中继（gemini-web2api 的 Node.js 内嵌重写）：进程内 OpenAI 兼容纯文本通道，
+  // 供 standard 聊天的 chatLlm 使用。端口被外部实例占用且健康时自动复用。
+  const geminiRelayPlugin = createGeminiWebRelayPlugin(config);
+  if (config.plugins.geminiRelay) {
+    pluginManager.register(geminiRelayPlugin);
+    await pluginManager.loadOne(geminiRelayPlugin);
+  }
+
   debouncePlugin.setHandler({
     shouldReplyCheck: async (message) => pluginManager.shouldReply(message),
     chatBatch: async (messages, triggerIndex) => {
-      const appends = await pluginManager.buildDynamicPromptAppends({ mode: "batch", messages });
-      const reply = await llm.chatBatch(messages, appends, triggerIndex);
-      try {
-        messageStore.appendBatchReply(messages, reply);
-      } catch (err) {
-        console.error("[MessageStore] 批量存储回复失败:", err);
+      const input = {
+        mode: "batch" as const,
+        messages,
+        triggerIndex,
+        environment: agentEnvironmentPlugin?.getEnvironment(messages[triggerIndex] ?? messages.at(-1)!),
+      };
+      const appends = await pluginManager.buildDynamicPromptAppends(input);
+      const result: ChatRunResult = chatAgentPlugin
+        ? await chatAgentPlugin.chatBatch(messages, appends, triggerIndex)
+        : {
+          text: await llm.chatBatch(
+            messages,
+            appends,
+            triggerIndex,
+            input.environment,
+            agentEnvironmentPlugin?.getSessionKey(messages[triggerIndex] ?? messages.at(-1)!),
+          ),
+          delivered: false,
+        };
+      if (input.environment === "restricted") {
+        try {
+          messageStore.appendBatchReply(messages, result.text, result.deliveredMessageIds?.[0]);
+        } catch (err) {
+          console.error("[MessageStore] 批量存储回复失败:", err);
+        }
       }
-      return reply;
+      return result;
     },
     sendResponse: (target, text, context) => responsePipeline.send(target, text, { context }),
   });
 
-  async function sendReply(message: BotMessage, reply: string, options: { quote?: boolean } = {}) {
+  async function sendReply(
+    message: BotMessage,
+    reply: string,
+    options: { quote?: boolean; onSentMessageIds?: (ids: string[]) => void } = {},
+  ) {
     const target = message.type === "group"
       ? { type: "group" as const, id: message.groupId! }
       : { type: "private" as const, id: message.userId! };
@@ -792,14 +1030,9 @@ async function main() {
     await responsePipeline.send(target, reply, {
       context: transformContext,
       quoteMessageId: options.quote ? message.id : undefined,
-    });
-  }
-
-  if (config.plugins.adminAssist) {
-    adminAssistPlugin.setHandler({
-      buildDynamicPromptAppends: async (message) => pluginManager.buildDynamicPromptAppends({ mode: "single", message }),
-      generateReply: async (message, dynamicPromptAppends) => llm.chat(message, dynamicPromptAppends),
-      sendReply: (message, reply) => sendReply(message, reply, { quote: true }),
+      // 透传调用方的 onSentMessageIds 收集器（chat 插件经 deliverReply 注入），
+      // 使 ChatRunResult.deliveredMessageIds 能拿到实际发出的 message_id。
+      onSentMessageIds: options.onSentMessageIds,
     });
   }
 
@@ -847,23 +1080,42 @@ async function main() {
   onebot.on("message", async (message: BotMessage) => {
     console.log(`[Message] ${message.type} | ${message.userId}: ${message.text}`);
 
-    messageStore.appendIncoming(message);
-
     const blocked = await pluginManager.processMessage(message);
     if (blocked) return;
+
+    const environment = agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted";
+    if (environment === "restricted") {
+      messageStore.appendIncoming(message);
+    }
 
     const shouldReply = await pluginManager.shouldReply(message);
     if (!shouldReply) return;
 
     try {
-      const dynamicAppends = await pluginManager.buildDynamicPromptAppends({ mode: "single", message });
-      const reply = await llm.chat(message, dynamicAppends);
-      try {
-        messageStore.appendReply(message, reply);
-      } catch (err) {
-        console.error("[MessageStore] 存储回复失败:", err);
+      const dynamicAppends = await pluginManager.buildDynamicPromptAppends({ mode: "single", message, environment });
+      const result: ChatRunResult = chatAgentPlugin
+        ? await chatAgentPlugin.chat(message, dynamicAppends)
+        : {
+          text: await llm.chat(
+            message,
+            dynamicAppends,
+            environment,
+            agentEnvironmentPlugin?.getSessionKey(message),
+          ),
+          delivered: false,
+        };
+      if (environment === "restricted") {
+        try {
+          // 关联 bot 回复实际发出的 message_id（可能多条，取第一条；由 chat 层经
+          // onSentMessageIds 回传），供用户之后引用该消息时通过 findMessageById 回溯。
+          messageStore.appendReply(message, result.text, result.deliveredMessageIds?.[0]);
+        } catch (err) {
+          console.error("[MessageStore] 存储回复失败:", err);
+        }
       }
-      await sendReply(message, reply);
+      if (!result.delivered) {
+        await sendReply(message, result.text);
+      }
       await autoCheckin(message);
     } catch (error) {
       console.error("[Bot] 回复失败:", error);
@@ -923,8 +1175,10 @@ async function main() {
     process.exit(1);
   }
 
-  const shutdown = () => {
+  const shutdown = async () => {
     console.log("\n[Bot] 正在关闭...");
+    await geminiRelayPlugin.close();
+    chatAgentPlugin?.close();
     if (personaEngineRef) {
       personaEngineRef.stop();
     }

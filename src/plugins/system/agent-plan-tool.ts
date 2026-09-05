@@ -1,5 +1,6 @@
 import type { BotToolRegistration } from "../../tooling.js";
 import type { PromptBuildInput } from "../../types.js";
+import { getInputMessage } from "../../security/access-control.js";
 
 type PlanStatus = "pending" | "in_progress" | "completed" | "blocked";
 
@@ -117,7 +118,7 @@ function parsePlanItems(value: unknown): PlanItem[] {
 }
 
 function getSessionKey(input: PromptBuildInput): string {
-  const message = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+  const message = getInputMessage(input);
   return message.type === "group" ? `group:${message.groupId ?? "unknown"}` : `private:${message.userId ?? "unknown"}`;
 }
 

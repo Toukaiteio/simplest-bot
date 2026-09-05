@@ -16,15 +16,86 @@ export function createSystemPlugin(
   blacklistPlugin: BlacklistPlugin,
   groupTriggerPlugin: GroupTriggerPlugin,
   menuPlugin: MenuPlugin,
-  contextManager?: ContextManager
+  contextManager?: ContextManager,
+  getChatAgentPlugin?: () => ({
+    isBusy: (message: BotMessage) => boolean;
+    stopCurrentTask: (message: BotMessage) => boolean;
+  }) | null,
 ): Plugin {
+  // ── 强制终止任务的投票状态（每个会话独立，60 秒窗口） ──
+  const STOP_VOTE_WINDOW_MS = 60_000;
+  const stopVotes = new Map<string, { voters: Set<string>; expiresAt: number }>();
+
+  function conversationKey(message: BotMessage): string {
+    return message.type === "private" ? `user:${message.userId}` : `group:${message.groupId}`;
+  }
+
+  function purgeStopVotes(key: string): void {
+    stopVotes.delete(key);
+  }
+
+  function isAdmin(message: BotMessage, ctx: PluginContext): boolean {
+    return Boolean(ctx.config.auth.adminUserIds.includes(message.userId || ""));
+  }
+
+  function doStop(message: BotMessage, ctx: PluginContext, key: string): void {
+    purgeStopVotes(key);
+    const agent = getChatAgentPlugin?.() ?? null;
+    if (!agent) {
+      void ctx.replyText(message, "聊天 Agent 未启用，无法终止任务。");
+      return;
+    }
+    const stopped = agent.stopCurrentTask(message);
+    void ctx.replyText(message, stopped ? "🛑 已强制终止当前任务。" : "当前没有正在执行的任务。");
+  }
+
   return {
     name: "system",
     description: "系统管理命令与内置服务",
 
     onLoad(ctx: PluginContext) {
-      menuPlugin.registerCommandGroup("system", "系统管理", "插件管理、黑名单、关键词过滤");
+      menuPlugin.registerCommandGroup("system", "系统管理", "插件管理、黑名单、关键词过滤、任务终止");
       const prefix = menuPlugin.getPrefix();
+
+      menuPlugin.registerCommand(
+        "stop",
+        "强制终止当前任务：管理员直接执行，普通用户需两人同意 [管理员/双人确认]",
+        async (message: BotMessage) => {
+          const key = conversationKey(message);
+          const now = Date.now();
+
+          // 管理员直接终止。
+          if (isAdmin(message, ctx)) {
+            doStop(message, ctx, key);
+            return;
+          }
+
+          const userId = message.userId || "";
+          if (!userId) {
+            void ctx.replyText(message, "无法识别发送者，无法执行终止。");
+            return;
+          }
+
+          // 普通用户：归票制，两个不同用户同意后终止。
+          const existing = stopVotes.get(key);
+          const voters = existing && existing.expiresAt > now
+            ? existing.voters
+            : new Set<string>();
+          voters.add(userId);
+          stopVotes.set(key, { voters, expiresAt: now + STOP_VOTE_WINDOW_MS });
+
+          if (voters.size >= 2) {
+            doStop(message, ctx, key);
+            return;
+          }
+
+          const need = 2 - voters.size;
+          void ctx.replyText(
+            message,
+            `🛑 收到终止任务请求（${voters.size}/2）。还需 ${need} 位不同用户发送 ${prefix}stop 同意，60 秒内有效。`,
+          );
+        },
+      );
 
       menuPlugin.registerCommand("clear", "清除当前对话历史 [管理员]", async (message: BotMessage) => {
         memory.clearHistory(message);

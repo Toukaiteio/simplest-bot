@@ -365,7 +365,9 @@ export class ContextManager {
         `dropped=[${result.droppedChunkIds.join(", ")}], [${chunkSummary}]`
     );
 
-    this.persistStateSoon(sessionKey);
+    if (options.persist !== false) {
+      this.persistStateSoon(sessionKey);
+    }
     return result;
   }
 

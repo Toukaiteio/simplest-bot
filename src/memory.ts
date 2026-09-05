@@ -10,6 +10,24 @@ export type MemoryMessage = {
 
 type CompressCallback = (history: MemoryMessage[]) => Promise<string>;
 
+export type ContextHistoryCompactionResult = {
+  history: MemoryMessage[];
+  compressed: boolean;
+  beforeChars: number;
+  afterChars: number;
+};
+
+export type PersistedContextCompactionReport = {
+  checked: number;
+  compressed: number;
+  failed: number;
+  beforeChars: number;
+  afterChars: number;
+  scopes: string[];
+};
+
+const HISTORY_CHAR_OVERHEAD = 16;
+
 export class MemoryManager {
   private conversationHistory = new Map<string, MemoryMessage[]>();
   private config: MemoryConfig;
@@ -91,14 +109,22 @@ export class MemoryManager {
     console.log("[Memory] 使用 SQLite + 本地快照作为记忆源");
   }
 
-  private getHistoryKey(message: BotMessage): string {
-    if (message.type === "private") return `user:${message.userId}`;
-    return `group:${message.groupId}`;
+  private getHistoryKey(message: BotMessage, path?: string): string {
+    const base = message.type === "private" ? `user:${message.userId}` : `group:${message.groupId}`;
+    // 三条路径（standard/voice/agent）上下文独立：只有 standard 沿用无后缀键（兼容存档历史），
+    // voice/agent 使用带后缀键，会话历史互不混入。
+    return path && path !== "standard" ? `${base}:${path}` : base;
   }
 
-  private ensureConversationHydrated(message: BotMessage) {
-    const key = this.getHistoryKey(message);
+  private ensureConversationHydrated(message: BotMessage, path?: string) {
+    const key = this.getHistoryKey(message, path);
     if (this.hydratedKeys.has(key)) {
+      return;
+    }
+
+    if (path && path !== "standard") {
+      // voice/agent 路径与存档历史独立：不从 SQLite/快照恢复，按新会话开始。
+      this.hydratedKeys.add(key);
       return;
     }
 
@@ -195,9 +221,9 @@ export class MemoryManager {
     }
   }
 
-  async addMessage(message: BotMessage, response: string) {
-    const key = this.getHistoryKey(message);
-    this.ensureConversationHydrated(message);
+  async addMessage(message: BotMessage, response: string, path?: string) {
+    const key = this.getHistoryKey(message, path);
+    this.ensureConversationHydrated(message, path);
     const history = this.conversationHistory.get(key) || [];
 
     appendConversationTurn(history, formatConversationChunk([message]), response);
@@ -208,9 +234,9 @@ export class MemoryManager {
     this.persistConversationHistorySoon();
   }
 
-  getConversationHistory(message: BotMessage): MemoryMessage[] {
-    this.ensureConversationHydrated(message);
-    const key = this.getHistoryKey(message);
+  getConversationHistory(message: BotMessage, path?: string): MemoryMessage[] {
+    this.ensureConversationHydrated(message, path);
+    const key = this.getHistoryKey(message, path);
     const history = this.conversationHistory.get(key) || [];
 
     // 只返回最近若干条，不全量恢复
@@ -225,8 +251,184 @@ export class MemoryManager {
     return history.slice(-limit);
   }
 
-  clearHistory(message: BotMessage) {
-    const key = this.getHistoryKey(message);
+  /**
+   * 按实际上下文字符预算压缩会话历史。
+   *
+   * getConversationHistory 仍然负责兼容旧的“按条数”读取逻辑；这个入口
+   * 专门给 pi-agent 在发起请求前使用，保证摘要和最近消息一起落在指定预算内，
+   * 并把结果写回当前会话，避免下一轮/重启后又恢复同一份超长历史。
+   */
+  async compactHistoryForContext(
+    message: BotMessage,
+    path: string | undefined,
+    maxChars: number,
+    summaryMaxChars = 1800,
+  ): Promise<ContextHistoryCompactionResult> {
+    this.ensureConversationHydrated(message, path);
+    const key = this.getHistoryKey(message, path);
+    const history = this.conversationHistory.get(key) || [];
+    const result = await this.compactHistoryEntries(history, maxChars, summaryMaxChars);
+
+    if (result.compressed) {
+      this.conversationHistory.set(key, result.history);
+      this.persistConversationHistorySoon();
+    }
+    return result;
+  }
+
+  /**
+   * 启动时整理已经保存的会话快照。只处理超过预算的快照，因此重复启动
+   * 不会重复调用主线路；压缩后的快照会直接写回 SQLite。
+   */
+  async compactPersistedConversationsForContext(
+    maxChars: number,
+    summaryMaxChars = 1800,
+  ): Promise<PersistedContextCompactionReport> {
+    const report: PersistedContextCompactionReport = {
+      checked: 0,
+      compressed: 0,
+      failed: 0,
+      beforeChars: 0,
+      afterChars: 0,
+      scopes: [],
+    };
+    const store = this.messageStore;
+    if (!store) return report;
+
+    let snapshots: Map<string, unknown[]>;
+    try {
+      snapshots = store.getAllConversationSnapshots();
+    } catch (error) {
+      console.error("[Memory] 读取已保存会话快照失败:", error);
+      return report;
+    }
+
+    for (const [scope, rawHistory] of snapshots) {
+      const history = normalizeHistory(rawHistory as MemoryMessage[]);
+      if (history.length === 0) continue;
+
+      report.checked += 1;
+      try {
+        const result = await this.compactHistoryEntries(history, maxChars, summaryMaxChars);
+        report.beforeChars += result.beforeChars;
+        report.afterChars += result.afterChars;
+        if (!result.compressed) continue;
+
+        this.conversationHistory.set(scope, result.history);
+        // 避免后续首次读取时又从 SQLite 的完整轮次重建出超长历史。
+        this.hydratedKeys.add(scope);
+        store.saveConversationSnapshot(scope, result.history);
+        report.compressed += 1;
+        report.scopes.push(scope);
+      } catch (error) {
+        report.failed += 1;
+        console.error(`[Memory] 压缩已保存会话失败：${scope}`, error);
+      }
+    }
+
+    return report;
+  }
+
+  private async compactHistoryEntries(
+    history: MemoryMessage[],
+    maxChars: number,
+    summaryMaxChars: number,
+  ): Promise<ContextHistoryCompactionResult> {
+    const beforeChars = estimateHistoryChars(history);
+    const safeMaxChars = Math.max(0, Math.floor(maxChars));
+
+    if (beforeChars <= safeMaxChars) {
+      return {
+        history: history.slice(),
+        compressed: false,
+        beforeChars,
+        afterChars: beforeChars,
+      };
+    }
+
+    const hasSummary = history[0]?.role === "system";
+    const previousSummary = hasSummary ? history[0].content : "";
+    const entries = history.slice(hasSummary ? 1 : 0);
+    const boundedSummaryMax = Math.max(0, Math.min(Math.floor(summaryMaxChars), safeMaxChars));
+    const summaryPrefix = "[历史摘要] ";
+    const recentBudget = Math.max(
+      0,
+      safeMaxChars - (boundedSummaryMax > 0 ? boundedSummaryMax + HISTORY_CHAR_OVERHEAD : 0),
+    );
+
+    // 从尾部尽可能保留完整的近期消息；过早的 assistant 消息不单独保留，
+    // 避免压缩后出现没有对应用户问题的孤立回答。
+    let keepStart = entries.length;
+    while (keepStart > 0 && estimateHistoryChars(entries.slice(keepStart - 1)) <= recentBudget) {
+      keepStart -= 1;
+    }
+    let dropped = entries.slice(0, keepStart);
+    let recent = entries.slice(keepStart);
+    while (recent[0]?.role === "assistant") {
+      const orphan = recent.shift();
+      if (orphan) dropped.push(orphan);
+    }
+
+    const summaryInput: MemoryMessage[] = [
+      ...(previousSummary ? [{ role: "system" as const, content: previousSummary }] : []),
+      ...dropped,
+    ];
+    let summary = "";
+    if (summaryInput.length > 0) {
+      try {
+        summary = (await this.compressSummary(summaryInput)).trim();
+      } catch (error) {
+        console.warn("[Memory] 上下文摘要失败，使用省略标记:", error);
+      }
+    }
+    if (!summary) {
+      summary = [
+        previousSummary,
+        dropped.length > 0 ? `已自动省略 ${dropped.length} 条较早对话。` : "",
+      ].filter(Boolean).join("\n");
+    }
+
+    const createCompacted = (summaryText: string, recentEntries: MemoryMessage[]): MemoryMessage[] => {
+      const recentChars = estimateHistoryChars(recentEntries);
+      const summaryContentLimit = Math.max(
+        0,
+        safeMaxChars - recentChars - HISTORY_CHAR_OVERHEAD - summaryPrefix.length,
+      );
+      const boundedSummary = truncateText(summaryText, Math.min(boundedSummaryMax, summaryContentLimit));
+      const compacted = boundedSummary
+        ? [{ role: "system" as const, content: `${summaryPrefix}${boundedSummary}` }, ...recentEntries]
+        : [...recentEntries];
+      return normalizeHistory(compacted);
+    };
+
+    let compacted = createCompacted(summary, recent);
+    while (estimateHistoryChars(compacted) > safeMaxChars && recent.length > 0) {
+      recent = recent.slice(1);
+      compacted = createCompacted(summary, recent);
+    }
+
+    // 极端情况下单条近期消息本身就超过预算；最后再压缩其文本，确保方法
+    // 返回的历史不会越过调用方给出的硬预算。
+    if (estimateHistoryChars(compacted) > safeMaxChars && compacted.length > 0) {
+      const last = compacted[compacted.length - 1];
+      const contentLimit = Math.max(0, safeMaxChars - HISTORY_CHAR_OVERHEAD);
+      compacted[compacted.length - 1] = {
+        ...last,
+        content: truncateText(last.content, contentLimit),
+      };
+      compacted = normalizeHistory(compacted);
+    }
+
+    return {
+      history: compacted.slice(),
+      compressed: true,
+      beforeChars,
+      afterChars: estimateHistoryChars(compacted),
+    };
+  }
+
+  clearHistory(message: BotMessage, path?: string) {
+    const key = this.getHistoryKey(message, path);
     this.conversationHistory.delete(key);
     this.hydratedKeys.delete(key);
     if (this.messageStore) {
@@ -247,12 +449,12 @@ export class MemoryManager {
     return facts.slice(0, limit).map((f) => f.content);
   }
 
-  async addBatch(messages: BotMessage[], response: string) {
+  async addBatch(messages: BotMessage[], response: string, path?: string) {
     if (messages.length === 0) return;
 
     const primary = messages[0];
-    const key = this.getHistoryKey(primary);
-    this.ensureConversationHydrated(primary);
+    const key = this.getHistoryKey(primary, path);
+    this.ensureConversationHydrated(primary, path);
     const history = this.conversationHistory.get(key) || [];
 
     appendConversationTurn(history, formatConversationChunk(messages), response);
@@ -335,6 +537,23 @@ function normalizeHistory(history: MemoryMessage[] | undefined): MemoryMessage[]
     && item.content.length > 0
   ));
   return coalesceUserChunks(filtered);
+}
+
+function estimateHistoryChars(history: MemoryMessage[]): number {
+  return history.reduce((total, message) => total + message.content.length + HISTORY_CHAR_OVERHEAD, 0);
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+
+  const marker = "…[已截断]…";
+  if (maxChars <= marker.length) return text.slice(0, maxChars);
+
+  const available = maxChars - marker.length;
+  const headLength = Math.ceil(available / 2);
+  const tailLength = Math.floor(available / 2);
+  return `${text.slice(0, headLength)}${marker}${tailLength > 0 ? text.slice(-tailLength) : ""}`;
 }
 
 function coalesceUserChunks(history: MemoryMessage[]): MemoryMessage[] {

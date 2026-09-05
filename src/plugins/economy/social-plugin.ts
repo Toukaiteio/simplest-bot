@@ -9,6 +9,7 @@ import type {
 } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
 import { MessageStore } from "../../message-store.js";
+import { getInputMessage } from "../../security/access-control.js";
 import { MMORPG_RULEBOOK, affinityToPercent, clampAffinity } from "../mmorpg/rulebook.js";
 import { makeTool, normalizeOptionalUserId } from "../mmorpg/framework/utils.js";
 import { screenshotHtml } from "../mmorpg/screenshot.js";
@@ -90,7 +91,7 @@ export function createSocialPlugin(
     cooldownRounds: number,
   ): BotToolRegistration {
     return makeTool(name, description, affinityToolParams, async (args, input) => {
-      const msg = input.mode === "single" ? input.message : input.messages[input.messages.length - 1];
+      const msg = getInputMessage(input);
       const targetUserId = normalizeOptionalUserId(typeof args.user_id === "string" ? args.user_id : undefined) ?? msg?.userId;
       if (!targetUserId) return "无法确定目标用户。";
 
@@ -229,7 +230,7 @@ export function createSocialPlugin(
 
     onBuildSystemPrompt(input: PromptBuildInput): string {
       const messages = input.mode === "single" ? [input.message] : input.messages;
-      const currentMessage = messages[messages.length - 1];
+      const currentMessage = getInputMessage(input);
       if (!currentMessage?.userId) {
         return "";
       }
