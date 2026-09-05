@@ -22,6 +22,7 @@ agents/
 
 # Debug and output files
 probe-proxy-out.txt
+probe-proxy.ts
 tsc-out.txt
 tsc-result.txt
 
@@ -31,11 +32,16 @@ scripts/.fetch-expand-progress.json
 scripts/.fetch-progress.json
 scripts/.work-tags-progress.json
 
-# Binary executables
+# Binary executables and tools
 scripts/synthid-remove/synthid-remove.exe
-scripts/realesrgan/realesrgan-ncnn-vulkan.exe
-scripts/realesrgan/*.dll
-
-# Raw data files
+scripts/realesrgan/
 scripts/character_images_raw.json
 scripts/id_tags_raw.js
+
+# Diagnostic scripts
+scripts/diag-app-proxy-e2e.ts
+scripts/diag-app-proxy.ts
+scripts/diag-clean-cut.ts
+
+# MMORPG game assets (generated images)
+mmorpg-menus/
