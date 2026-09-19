@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { Plugin, PluginContext, PromptBuildInput } from "../../types.js";
+import type { BotConfig, Plugin, PluginContext, PromptBuildInput } from "../../types.js";
 import type { BotToolRegistration } from "../../tooling.js";
 import { assertToolAccess, getAgentIdentity, getInputMessage } from "../../security/access-control.js";
 import { Workspace } from "./workspace.js";
@@ -9,6 +9,7 @@ import { createReadToolRegistrations } from "./tools-read.js";
 import { createWriteToolRegistrations } from "./tools-write.js";
 import { createGitToolRegistrations } from "./tools-git.js";
 import { createExecToolRegistration } from "./tools-exec.js";
+import { assertNoSymlinkComponents, ensureSafeDirectory, resolveRestrictedBaseRoot } from "./workspace-scope.js";
 
 type CodingToolsPlugin = Plugin & {
   getToolRegistrations: () => BotToolRegistration[];
@@ -73,59 +74,23 @@ export function createCodingToolsPlugin(): CodingToolsPlugin {
 
   function getScopedWorkspaceRoot(input: PromptBuildInput): string {
     if (!restrictedBaseRoot) throw new Error("受限 workspace 尚未初始化。");
-    const identity = getAgentIdentity(getInputMessage(input), ctxRef!.config);
-    const rawScope = identity.userId ?? `anonymous-${identity.groupId ?? "unknown"}`;
-    const scope = `user-${createHash("sha256").update(rawScope, "utf8").digest("hex")}`;
-    const usersRoot = ensureSafeDirectory(restrictedBaseRoot, "users");
-    return ensureSafeDirectory(usersRoot, scope);
+    return getScopedWorkspaceRootForRoot(restrictedBaseRoot, ctxRef!.config, input);
   }
 
   return plugin;
 }
 
-function resolveRestrictedBaseRoot(configuredRoot: string): string {
-  const sandboxRoot = path.resolve(process.cwd(), "data/agent-workspaces");
-  const requested = path.resolve(process.cwd(), configuredRoot);
-  return isSubPath(sandboxRoot, requested) ? requested : sandboxRoot;
-}
-
-function ensureSafeDirectory(base: string, ...segments: string[]): string {
-  let current = path.resolve(base);
-  assertNoSymlinkComponents(current, current);
-  for (const segment of segments) {
-    if (!/^[a-zA-Z0-9._-]+$/.test(segment)) throw new Error("受限 workspace 目录名无效。");
-    current = path.join(current, segment);
-    fs.mkdirSync(current, { recursive: true });
-    if (fs.lstatSync(current).isSymbolicLink()) {
-      throw new Error("受限 workspace 路径不能包含符号链接。");
-    }
-    if (!fs.statSync(current).isDirectory()) {
-      throw new Error("受限 workspace 路径不是目录。");
-    }
-  }
-  return current;
-}
-
-function assertNoSymlinkComponents(root: string, candidate: string): void {
-  const rootAbs = path.resolve(root);
-  const candidateAbs = path.resolve(candidate);
-  if (!isSubPath(rootAbs, candidateAbs)) throw new Error("受限 workspace 路径越界。");
-  if (!fs.existsSync(rootAbs)) return;
-  if (fs.lstatSync(rootAbs).isSymbolicLink()) throw new Error("受限 workspace 根目录不能是符号链接。");
-
-  let current = rootAbs;
-  const relative = path.relative(rootAbs, candidateAbs);
-  for (const segment of relative.split(path.sep).filter(Boolean)) {
-    current = path.join(current, segment);
-    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) {
-      throw new Error("受限 workspace 路径不能包含符号链接。");
-    }
-  }
-}
-
-function isSubPath(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+/** 共享给后台任务插件：同一用户的隔离目录规则必须与 workspace 工具完全一致。 */
+export function getScopedWorkspaceRootForRoot(
+  restrictedBaseRoot: string,
+  config: BotConfig,
+  input: PromptBuildInput,
+): string {
+  const identity = getAgentIdentity(getInputMessage(input), config);
+  const rawScope = identity.userId ?? `anonymous-${identity.groupId ?? "unknown"}`;
+  const scope = `user-${createHash("sha256").update(rawScope, "utf8").digest("hex")}`;
+  const usersRoot = ensureSafeDirectory(restrictedBaseRoot, "users");
+  return ensureSafeDirectory(usersRoot, scope);
 }
 
 function getRegistrationName(registration: BotToolRegistration): string {

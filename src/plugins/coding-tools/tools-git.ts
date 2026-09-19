@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { ToolError, Workspace } from "./workspace.js";
 import { truncateTextHead, parseGitBlame } from "./utils.js";
 
@@ -116,28 +117,32 @@ export function createGitToolRegistrations(workspace: Workspace): any[] {
 }
 
 function runGitAt(dir: string, args: string[], timeout: number): string {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "",
+    TEMP: dir,
+    TMP: dir,
+    HOME: dir,
+    USERPROFILE: dir,
+    XDG_CONFIG_HOME: dir,
+    GIT_CONFIG_GLOBAL: path.join(dir, ".agent-empty-gitconfig"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "cat",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  // Windows 子进程初始化需要这些变量；Linux 上无意义，不注入。
+  if (process.platform === "win32") {
+    env.PATHEXT = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD";
+    env.SystemRoot = process.env.SystemRoot ?? "C:\\Windows";
+    env.ComSpec = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
+  }
   const result = spawnSync("git", ["-C", dir, ...args], {
     encoding: "utf-8",
     timeout,
     maxBuffer: 8 * 1024 * 1024,
     shell: false,
     windowsHide: true,
-    env: {
-      PATH: process.env.PATH ?? "",
-      PATHEXT: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
-      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
-      ComSpec: process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe",
-      TEMP: dir,
-      TMP: dir,
-      HOME: dir,
-      USERPROFILE: dir,
-      XDG_CONFIG_HOME: dir,
-      GIT_CONFIG_GLOBAL: `${dir}\\.agent-empty-gitconfig`,
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_OPTIONAL_LOCKS: "0",
-      GIT_PAGER: "cat",
-      GIT_TERMINAL_PROMPT: "0",
-    },
+    env,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {

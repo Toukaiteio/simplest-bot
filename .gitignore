@@ -45,3 +45,7 @@ scripts/diag-clean-cut.ts
 
 # MMORPG game assets (generated images)
 mmorpg-menus/
+
+# Downloaded images / temp output in repo root
+/*.jfif
+/output.png

@@ -299,33 +299,21 @@ export function extractResponseText(raw: string): string {
 const BARD_ERROR_PATTERN = /BardErrorInfo\s*\[(\d+)\]/u;
 
 /**
- * 上游"软拒绝"话术：生成中途/开头插入的拒绝声明（非 BardErrorInfo 格式），
- * 如"我只是一个语言模型…""由于程序代码的局限…""我只会生成文本…"。
- * 出现在末行且不带已发送正文前缀时视为本轮被掐断。
+ * 预扫描所有 wrb.fr 文本，返回最长正文。
+ *
+ * 不做"软拒绝"检测与整轮重试：拒绝话术模式（"语言模型""无法回答"等）与正常
+ * 回答高度重叠——用户问"你是什么模型"时，诚实回答本身就包含这些字样，会被
+ * 误判为中途掐断并重试耗尽，用户反而什么都收不到。上游产出什么就转发什么
+ * （BardErrorInfo / HTTP 错误 / 空正文仍按失败重试）。
  */
-const SOFT_REFUSAL_PATTERN =
-  /(语言模型|程序代码的局限|程序逻辑范畴|没法帮|没法办到|无法(?:帮助|回答|生成|执行)|帮不上|无法提供)/u;
-
-/** 预扫描所有 wrb.fr 文本：返回（最长正文，是否软拒绝收尾）。 */
-function scanRawTexts(raw: string): { longest: string; endsWithSoftRefusal: boolean } {
+function scanLongestText(raw: string): string {
   let longest = "";
-  let last = "";
-  let any = false;
   for (const line of raw.split("\n")) {
     for (const text of extractTextsFromLineList(line)) {
       if (text.length > longest.length) longest = text;
-      last = text;
-      any = true;
     }
   }
-  return {
-    longest,
-    // 两种形态都算被拒：(a) 末行是拒绝话术且正文更长（中途掐断）；
-    // (b) 整轮唯一文本就是拒绝话术（开头即拒，last === longest，
-    //     实测会以 200 + 30 字左右拒语通过，必须同样重试）。
-    endsWithSoftRefusal: any && SOFT_REFUSAL_PATTERN.test(last)
-      && (last.length < longest.length || longest.length < 400),
-  };
+  return longest;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -387,15 +375,9 @@ export async function generateRelayText(
       if (bardError) {
         throw new Error(`Gemini upstream rejected request: BardErrorInfo [${bardError[1]}]`);
       }
-      // 中途软拒绝：末行是拒绝话术 → 无论正文多长都整轮重试。
-      // 正文几百字被掐断与一句话被掐断对用户同样不可接受；服务端 SSE
-      // 内部已全量缓冲（发送前重试），不存在重放问题。
-      const { longest, endsWithSoftRefusal } = scanRawTexts(raw);
-      if (endsWithSoftRefusal) {
-        if (config.logRequests) console.log(`[Relay] 上游软拒绝（正文 ${longest.length} 字符被掐断），重试`);
-        throw new Error("Gemini upstream soft-refused mid-stream");
-      }
-      const text = cleanRelayText(longest);
+      // 上游产出什么就转发什么：疑似拒绝话术的正文（如对"你是什么模型"的
+      // 诚实回答）不做整轮重试，直接交给下游。
+      const text = cleanRelayText(scanLongestText(raw));
       if (!text) {
         if (config.logRequests) {
           console.warn(`[Relay] 上游响应无可解析正文：HTTP ${fetched.status}，响应体 ${raw.length} 字符`);
@@ -446,14 +428,9 @@ export async function* streamGenerateRelayText(
       // 上游返回纯文本行（非 SSE）：buffered 读取整段后按行差分，
       // 与 python 的逐行 retry/delta 逻辑一致（每个后续行是累计全文）。
       // 与 python 一致：每行返回文本列表，逐一做前缀差分；非累计内容
-      // （另一个片段/候选版本，含中途插入的软拒绝话术）跳过而非抛错，
-      // 避免长回复中途断流。
-      // 预扫描：整轮几乎无正文且软拒绝收尾 → 尚未发出 delta，可安全重试整轮。
-      const pre = scanRawTexts(rawText);
-      if (pre.endsWithSoftRefusal && pre.longest.length < 200) {
-        throw new Error("Gemini upstream soft-refused mid-stream");
-      }
-      if (!pre.longest) {
+      // （另一个片段/候选版本）跳过而非抛错，避免长回复中途断流。
+      const longest = scanLongestText(rawText);
+      if (!longest) {
         if (config.logRequests) {
           console.warn(`[Relay] 上游流式响应无可解析正文：HTTP ${fetched.status}，响应体 ${rawText.length} 字符`);
         }

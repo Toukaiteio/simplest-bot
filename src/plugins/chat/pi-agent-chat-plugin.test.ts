@@ -42,6 +42,9 @@ await testAgentModeUsesWorkProtocol();
 await testVoiceAndStandardPathsHaveIndependentSessions();
 await testForcedVoiceToolChoiceIsMarkerDriven();
 await testStopCurrentTaskAbortsRunningAndPendingRequests();
+await testRealWorkGivesAdminRealEnvironmentAndIndependentSession();
+await testRealEnvironmentRequestFromNonAdminIsDowngraded();
+await testOversizedOldToolResultsAreShrunkNotDropped();
 
 console.log("✅ pi Agent Loop pending 队列与并行子代理测试通过");
 
@@ -667,6 +670,184 @@ async function testStopCurrentTaskAbortsRunningAndPendingRequests(): Promise<voi
   plugin.close();
 }
 
+/** 管理员显式声明 environment:"real" 时才进入真实环境；real 会话与受限 agent 会话隔离。 */
+async function testRealWorkGivesAdminRealEnvironmentAndIndependentSession(): Promise<void> {
+  const sent: SentMessage[] = [];
+  const observed: string[] = [];
+  const adminConfig = createTestConfig(["admin"]);
+  const admin = makeMessage("admin", "$real-work 检查宿主机磁盘占用", "m-real-admin");
+  const streamFn: StreamFn = (model, context) => {
+    observed.push(context.systemPrompt ?? "");
+    const stream = createAssistantMessageEventStream();
+    const toolNames = (context.tools ?? []).map((tool) => tool.name);
+    pushTextResponse(
+      stream,
+      model as Model<"openai-completions">,
+      toolNames.includes("agent_real_exec_command") ? "真实环境任务完成。" : "缺少真实环境工具。",
+    );
+    return stream;
+  };
+
+  const plugin = createPiAgentChatPlugin(createDeps(adminConfig, sent, streamFn));
+  plugin.setToolRegistrations([makeToolRegistration("agent_real_exec_command")]);
+
+  const realResult = await plugin.chat(admin, [], { mode: "agent", quote: true, environment: "real" });
+  assert.match(observed[0] ?? "", /\[管理员真实环境流\]/u, "管理员 real 请求应注入真实环境提示词");
+  assert.doesNotMatch(observed[0] ?? "", /\[受限工作流\]/u);
+  assert.equal(realResult.text, "真实环境任务完成。");
+
+  // 同一会话的受限 agent 路径（$work）不能看到真实环境工具，且会话彼此独立。
+  const workObserved: string[] = [];
+  const workStream: StreamFn = (model, context) => {
+    workObserved.push(context.systemPrompt ?? "");
+    const stream = createAssistantMessageEventStream();
+    pushTextResponse(stream, model as Model<"openai-completions">, "受限任务完成。");
+    return stream;
+  };
+  const workDeps = createDeps(adminConfig, sent, workStream);
+  const workPlugin = createPiAgentChatPlugin(workDeps);
+  workPlugin.setToolRegistrations([makeToolRegistration("agent_real_exec_command")]);
+  const workResult = await workPlugin.chat(makeMessage("admin", "$work 整理文件", "m-work-admin"), [], { mode: "agent" });
+  assert.match(workObserved[0] ?? "", /\[受限工作流\]/u, "同一管理员的 $work 仍应运行在受限环境");
+  assert.equal(workResult.text, "受限任务完成。");
+  assert.equal(
+    (workObserved[0] ?? "").includes("[管理员真实环境流]"),
+    false,
+    "受限会话的提示词不应携带真实环境能力说明",
+  );
+
+  plugin.close();
+  workPlugin.close();
+}
+
+/** 非管理员即使声明 environment:"real" 也必须被降级为受限环境。 */
+async function testRealEnvironmentRequestFromNonAdminIsDowngraded(): Promise<void> {
+  const sent: SentMessage[] = [];
+  const observed: string[] = [];
+  let observedToolNames: string[] = [];
+  const streamFn: StreamFn = (model, context) => {
+    observed.push(context.systemPrompt ?? "");
+    observedToolNames = (context.tools ?? []).map((tool) => tool.name);
+    const stream = createAssistantMessageEventStream();
+    pushTextResponse(stream, model as Model<"openai-completions">, "受限任务完成。");
+    return stream;
+  };
+
+  const plugin = createPiAgentChatPlugin(createDeps(createTestConfig(["admin"]), sent, streamFn));
+  plugin.setToolRegistrations([makeToolRegistration("agent_real_exec_command")]);
+
+  const result = await plugin.chat(
+    makeMessage("user-a", "$real-work 假装管理员", "m-real-non-admin"),
+    [],
+    { mode: "agent", environment: "real" },
+  );
+
+  assert.match(observed[0] ?? "", /\[受限工作流\]/u, "非管理员声明 real 应被降级为受限环境");
+  assert.doesNotMatch(observed[0] ?? "", /\[管理员真实环境流\]/u);
+  assert.equal(
+    observedToolNames.includes("agent_real_exec_command"),
+    false,
+    "非管理员的工具列表不应包含 admin-real 工具",
+  );
+  assert.equal(result.text, "受限任务完成。");
+
+  plugin.close();
+}
+
+/** 旧的超大工具输出应被截断压缩，而不是触发整条丢弃的硬裁剪。 */
+async function testOversizedOldToolResultsAreShrunkNotDropped(): Promise<void> {
+  const sent: SentMessage[] = [];
+  let streamCallCount = 0;
+  let secondTurnMessageCount = 0;
+  let secondTurnHasFirstUserMessage = false;
+  let secondTurnMaxToolResultChars = 0;
+  const BIG_TOOL_RESULT = "超长工具输出。".repeat(4000); // ~28k 字符
+
+  const streamFn: StreamFn = (model, context) => {
+    const stream = createAssistantMessageEventStream();
+    streamCallCount += 1;
+    const hasToolResult = (name: string) => context.messages.some(
+      (item) => item.role === "toolResult" && item.toolName === name,
+    );
+
+    if (streamCallCount === 1) {
+      pushToolResponse(stream, model as Model<"openai-completions">, "workspace_read_text", { path: "big.txt" });
+    } else if (streamCallCount === 2) {
+      pushToolResponse(stream, model as Model<"openai-completions">, "workspace_read_text", { path: "small-1.txt" });
+    } else if (streamCallCount === 3) {
+      pushToolResponse(stream, model as Model<"openai-completions">, "workspace_read_text", { path: "small-2.txt" });
+    } else if (streamCallCount === 4) {
+      pushToolResponse(stream, model as Model<"openai-completions">, "send_current_reply", { text: "第一轮任务完成。" });
+    } else {
+      // 第二轮：检查进入本轮的转写本。
+      secondTurnMessageCount = context.messages.length;
+      secondTurnHasFirstUserMessage = context.messages.some(
+        (message) => message.role === "user" && getMessageText(message).includes("第一轮任务"),
+      );
+      for (const message of context.messages) {
+        if (message.role !== "toolResult") continue;
+        const text = message.content
+          .map((part) => (part.type === "text" ? part.text : ""))
+          .join("");
+        secondTurnMaxToolResultChars = Math.max(secondTurnMaxToolResultChars, text.length);
+      }
+      pushToolResponse(stream, model as Model<"openai-completions">, "send_current_reply", { text: "第二轮任务完成。" });
+    }
+    void hasToolResult;
+    return stream;
+  };
+
+  const plugin = createPiAgentChatPlugin(createDeps(config, sent, streamFn));
+  plugin.setToolRegistrations([{
+    definition: {
+      type: "function",
+      function: {
+        name: "workspace_read_text",
+        description: "test",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"],
+        },
+      },
+    },
+    execute: async (args) => (args as { path: string }).path === "big.txt" ? BIG_TOOL_RESULT : "ok",
+  }]);
+
+  const first = await plugin.chat(makeMessage("user-a", "第一轮任务：读取大文件", "m-shrink-1"), [], { mode: "agent" });
+  assert.equal(first.text, "第一轮任务完成。");
+
+  const second = await plugin.chat(makeMessage("user-a", "第二轮任务：继续", "m-shrink-2"), [], { mode: "agent" });
+  assert.equal(second.text, "第二轮任务完成。");
+
+  assert.ok(
+    secondTurnMaxToolResultChars < 2_000,
+    `旧的超大工具输出应被截断（实际最长 ${secondTurnMaxToolResultChars} 字符）`,
+  );
+  assert.equal(
+    secondTurnHasFirstUserMessage,
+    true,
+    "压缩应截断工具输出而不是丢弃消息（第一轮用户消息应保留）",
+  );
+  assert.ok(secondTurnMessageCount >= 8, "转写本消息不应被整条移除");
+
+  plugin.close();
+}
+
+function makeToolRegistration(name: string): BotToolRegistration {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name,
+        description: "test",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+    },
+    execute: async () => "ok",
+  };
+}
+
 function createDeps(configValue: BotConfig, sent: SentMessage[], streamFn: StreamFn): PiAgentChatPluginDeps {
   const memory = new MemoryManager(configValue.memory);
   const llm = {
@@ -687,7 +868,7 @@ function createDeps(configValue: BotConfig, sent: SentMessage[], streamFn: Strea
   };
 }
 
-function createTestConfig(): BotConfig {
+function createTestConfig(adminUserIds: string[] = []): BotConfig {
   return botConfigSchema.parse({
     oneBot: { url: "ws://127.0.0.1:61111" },
     llm: {
@@ -697,7 +878,7 @@ function createTestConfig(): BotConfig {
       model: "test-model",
     },
     memory: { enabled: false },
-    auth: { adminUserIds: [] },
+    auth: { adminUserIds },
     blacklist: {},
     plugins: { chat: true, tts: true },
     pluginSettings: {},

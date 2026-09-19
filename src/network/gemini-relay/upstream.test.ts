@@ -8,6 +8,7 @@ import {
   extractResponseText,
   generateRelayText,
   quotePlus,
+  streamGenerateRelayText,
 } from "./upstream.js";
 import { resolveModel } from "./models.js";
 
@@ -133,6 +134,42 @@ const lineText = JSON.stringify(arr);
   assert.ok(threw, "body 读取永久挂起时应在 requestTimeoutSec 后超时抛错，而不是无限等待");
   assert.ok(elapsed < 8000, `body 读取应在短超时内结束，而非永久 hang（耗时 ${elapsed}ms）`);
   console.log(`✅ generateRelayText 在 body 读取挂起时，于 ${elapsed}ms 内超时（不再无限卡死）`);
+}
+
+// 软拒绝不再触发重试：含"语言模型/无法回答"等字样的正文（例如用户问
+// "你是什么模型"时的诚实回答）必须原样转发；按拒绝模式整轮重试只会
+// 耗尽次数后让用户什么都收不到。
+{
+  let calls = 0;
+  const refusalLike = "我是一个语言模型，无法回答这个问题。";
+  const text = await generateRelayText("你是什么模型", resolved, {
+    ...baseConfig,
+    retryAttempts: 3,
+    fetchFn: () => {
+      calls += 1;
+      return Promise.resolve(new Response(buildWrbLine(refusalLike), { status: 200 }));
+    },
+  });
+  assert.equal(calls, 1, "疑似软拒绝的正文不应触发重试");
+  assert.equal(text, refusalLike, "疑似软拒绝的正文应诚实转发");
+}
+
+// 流式路径同样不重试、不丢弃：疑似拒绝话术的正文按前缀差分完整产出。
+{
+  let calls = 0;
+  const refusalLike = "我是 GLM，一个大语言模型。";
+  let output = "";
+  const stream = streamGenerateRelayText("你是什么模型", resolved, {
+    ...baseConfig,
+    retryAttempts: 3,
+    fetchFn: () => {
+      calls += 1;
+      return Promise.resolve(new Response(buildWrbLine(refusalLike), { status: 200 }));
+    },
+  });
+  for await (const delta of stream) output += delta;
+  assert.equal(calls, 1, "流式路径疑似软拒绝不应触发重试");
+  assert.equal(output, refusalLike, "流式路径疑似软拒绝的正文应诚实转发");
 }
 
 console.log("✅ Gemini relay upstream 序列化与解析测试通过");

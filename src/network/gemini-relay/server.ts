@@ -325,8 +325,9 @@ export function createGeminiRelayServer(
   ): Promise<void> {
     // 虽然 SSE 协议在接口层保留（pi-ai 客户端硬编码 stream:true），但内部走
     // 非流式生成：上游响应本就是全量缓冲的假流，bot 侧回复也是整段交付。
-    // 换来的关键收益：软拒绝/上游掐断可在尚未发出任何内容前整轮重试，
+    // 换来的关键收益：上游错误/空响应可在尚未发出任何内容前整轮重试，
     // 重试耗尽返回 502 让客户端回退其它提供商，而不是把半截回复发给用户。
+    // 正文内容（含疑似拒绝话术）不做重试，诚实转发。
     let text: string;
     try {
       text = await generateWithImages(prompt, images, resolved);
@@ -450,7 +451,7 @@ export function createGeminiRelayServer(
     resolved: ResolvedModel,
   ): Promise<void> {
     // 与 streamChatCompletions 相同：SSE 接口保留，内部走非流式生成以获得
-    // 发送前整轮重试（软拒绝/掐断）与 502 回退语义。
+    // 发送前整轮重试（上游错误/空响应）与 502 回退语义。
     let text: string;
     try {
       text = await generateWithImages(prompt, images, resolved);

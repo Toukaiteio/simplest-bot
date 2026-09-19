@@ -60,7 +60,6 @@ import { createRewardSystemPlugin } from "./plugins/economy/reward-system-plugin
 import { createSystemPlugin } from "./plugins/system/system-plugin.js";
 import { createIdentityPlugin } from "./plugins/system/identity-plugin.js";
 import { createAgentPolicyPlugin } from "./plugins/system/agent-policy-plugin.js";
-import { createAgentEnvironmentPlugin, type AgentEnvironmentPlugin } from "./plugins/system/agent-environment-plugin.js";
 import { createTodoPlugin } from "./plugins/system/todo-plugin.js";
 import { AGENT_PLAN_SYSTEM_PROMPT, createAgentPlanToolRegistrations } from "./plugins/system/agent-plan-tool.js";
 import { createChatSearchPlugin } from "./plugins/system/chat-search-plugin.js";
@@ -76,6 +75,8 @@ import { createFileWorkspacePlugin } from "./plugins/system/file-workspace-plugi
 import { createCodingToolsPlugin } from "./plugins/coding-tools/plugin.js";
 import { createAgentRealToolRegistrations } from "./plugins/system/agent-real-tools.js";
 import { createDesktopToolRegistrations } from "./plugins/system/desktop-tools.js";
+import { createAgentBackgroundPlugin, type AgentBackgroundPlugin } from "./plugins/system/agent-background-plugin.js";
+import { browseToolRegistration } from "./plugins/system/browse-tool.js";
 import { createVoiceTtsPlugin } from "./plugins/system/voice-tts-plugin.js";
 import { initVoiceMessageRegistry } from "./plugins/system/voice-message-registry.js";
 import { createWebFetchPlugin, webfetchToolRegistration } from "./plugins/webfetch.js";
@@ -104,7 +105,7 @@ import { EvolutionEngine } from "./persona/evolution-engine.js";
 import { renderGlobalStyle, renderSoftCore } from "./persona/render.js";
 import { makeTool } from "./plugins/mmorpg/framework/utils.js";
 import type { BotToolRegistration } from "./tooling.js";
-import { assertToolAccess, canUseTool, getAdminUserIds, getAgentIdentity, getInputMessage, isPrivilegedToolName } from "./security/access-control.js";
+import { assertToolAccess, canUseTool, getAdminUserIds, getAgentIdentity, getInputMessage, isAdminMessage, isPrivilegedToolName } from "./security/access-control.js";
 import { AGENT_STABLE_WORK_PROMPT } from "./security/agent-prompt.js";
 import { configureGlobalProxy } from "./network/proxy.js";
 import type {
@@ -166,7 +167,6 @@ async function main() {
     },
   });
 
-  let agentEnvironmentPlugin: AgentEnvironmentPlugin | null = null;
   let chatAgentPlugin: PiAgentChatPlugin | null = null;
   const pluginContext: PluginContext = {
     config,
@@ -185,9 +185,10 @@ async function main() {
       return memory.getUserFacts(userId);
     },
     getAgentIdentity: (message) => getAgentIdentity(message, config),
-    getAgentEnvironment: (message) => agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted",
-    getAgentSessionKey: (message) => agentEnvironmentPlugin?.getSessionKey(message)
-      ?? getAgentIdentity(message, config).conversationKey,
+    // 真实环境不再由会话开关决定：只有管理员显式发起的 $real-work 任务会以
+    // environment: "real" 走 chat 插件，其余消息驱动流程一律受限环境。
+    getAgentEnvironment: () => "restricted",
+    getAgentSessionKey: (message) => getAgentIdentity(message, config).conversationKey,
   };
 
   pluginManager.setContext(pluginContext);
@@ -212,9 +213,6 @@ async function main() {
   const menu: MenuPlugin = createMenuPlugin(coreCmd);
   pluginManager.register(menu);
 
-  agentEnvironmentPlugin = createAgentEnvironmentPlugin(menu);
-  pluginManager.register(agentEnvironmentPlugin);
-
   pluginManager.register(createTimePlugin());
 
   const inventory: InventoryPlugin = createInventoryPlugin(store);
@@ -237,6 +235,12 @@ async function main() {
   const codingToolsPlugin = createCodingToolsPlugin();
   if (config.plugins.codingTools) {
     pluginManager.register(codingToolsPlugin);
+  }
+
+  // 后台任务（URL 监控/受限命令/提醒）依赖 chat Agent 的唤醒通道，随 chat 开关。
+  const agentBackgroundPlugin: AgentBackgroundPlugin = createAgentBackgroundPlugin(config);
+  if (config.plugins.chat) {
+    pluginManager.register(agentBackgroundPlugin);
   }
   initVoiceMessageRegistry(config.pluginSettings.tts.voiceRegistryDataFile);
   initSentImageTexts(config.pluginSettings.chatAgent.sentImageTextsDataFile);
@@ -680,6 +684,9 @@ async function main() {
     toolRegistrations.push(...codingToolsPlugin.getToolRegistrations());
     console.log(`[CodingTools] 已注册工作区级读写工具`);
   }
+  if (config.plugins.chat) {
+    toolRegistrations.push(...agentBackgroundPlugin.getToolRegistrations());
+  }
   if (config.plugins.tts) {
     toolRegistrations.push(...voiceTtsPlugin.getToolRegistrations());
   }
@@ -718,6 +725,8 @@ async function main() {
         return browserRegistration.execute(args, input);
       },
     });
+    // browse：只读浏览（页面结构化为 markdown），普通用户可用；SSRF 防护内建。
+    toolRegistrations.push(browseToolRegistration(config));
   }
   toolRegistrations.push(...contextManager.getToolRegistrations());
   if (config.plugins.todo) {
@@ -903,9 +912,8 @@ async function main() {
       // chat 插件按字符预算注入压缩摘要（人格与工作协议仍仅保留在 voice/agent 通道）。
       systemPrompt: "",
       getDynamicPromptAppends: (input) => pluginManager.buildDynamicPromptAppends(input),
-      getAgentEnvironment: (message) => agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted",
-      getAgentSessionKey: (message) => agentEnvironmentPlugin?.getSessionKey(message)
-        ?? getAgentIdentity(message, config).conversationKey,
+      // 真实环境只可能由 $real-work 以 deliveryOptions.environment 显式声明，
+      // 这里不再从会话状态推导。
       sendReply: (message, text, options) => sendReply(message, text, options),
       resolveQuotedMessage: createQuotedMessageResolver({
         findMessageById: (messageId) => messageStore.findMessageById(messageId),
@@ -925,17 +933,24 @@ async function main() {
     chatAgentPlugin.setToolRegistrations(guardedToolRegistrations);
     pluginManager.register(chatAgentPlugin);
     await pluginManager.loadOne(chatAgentPlugin);
+    // 后台任务完成 → 以受限 agent 会话唤醒该会话继续处理（永远不进入真实环境）。
+    agentBackgroundPlugin.setWakeHandler((message, appends) =>
+      chatAgentPlugin!.chat(message, appends, { mode: "agent", quote: false }),
+    );
   }
 
-  // 聊天模式命令：$voice（语音会话，注入角色设定 + 强制语音交付）与 $work（工作 Agent，
-  // 带工具与工作协议）。普通聊天为默认 standard 模式；三条路径（standard/voice/agent）
-  // 的会话上下文各自独立。语音不再由 chat 层自动触发。
+  // 聊天模式命令：$voice（语音会话，注入角色设定 + 强制语音交付）、$work（受限环境
+  // 工作 Agent）与 $real-work（管理员专用，单次任务直接以真实环境运行）。普通聊天为
+  // 默认 standard 模式；各路径的会话上下文彼此独立。语音不再由 chat 层自动触发。
+  // 真实环境没有"进入/退出"开关：它只在管理员显式发起一条 $real-work 任务时存在，
+  // 任务结束即消失，避免无限制 shell 长时间暴露给持续处理不可信消息的 LLM。
   if (chatAgentPlugin) {
     const chatModeCommandsPlugin: import("./types.js").Plugin = {
       name: "chat-mode-commands",
-      description: "$voice / $work 聊天模式命令",
+      description: "$voice / $work / $real-work 聊天模式命令",
       onLoad() {
         const prefix = menu.getPrefix();
+        menu.registerCommandGroup("agent", "工作代理", "工作环境与 Agent 执行流");
         menu.registerCommand(
           "voice",
           `语音聊天：${prefix}voice <内容>（AI 以角色设定生成适合朗读的口语回复，并用语音消息发送）`,
@@ -955,7 +970,7 @@ async function main() {
         );
         menu.registerCommand(
           "work",
-          `工作执行：${prefix}work <任务>（AI 使用工具实际完成任务，并以消息交付结果）`,
+          `工作执行（受限环境）：${prefix}work <任务>（AI 在用户隔离的受限 workspace 中使用工具完成任务）`,
           async (message, args, ctx) => {
             const content = args.join(" ").trim();
             if (!content) {
@@ -965,10 +980,34 @@ async function main() {
             const workDirective = [
               "[$work 命令指令]",
               `用户通过 ${prefix}work 命令请求工作：“${content}”。`,
-              "这是明确的工作请求：使用可用工具实际完成任务，按工作协议用 send_current_reply 交付结果，不要只给出建议。",
+              "这是明确的工作请求：使用可用工具实际完成任务，按工作协议用 send_current_reply 交付结果，不要只给出建议。当前运行在受限工作环境。",
             ].join("\n");
             await chatAgentPlugin.chat(message, [workDirective], { mode: "agent", quote: true });
           },
+        );
+        menu.registerCommand(
+          "real-work",
+          `真实环境工作 [管理员]：${prefix}real-work <任务>（仅管理员；单次任务以宿主真实权限运行 Agent）`,
+          async (message, args, ctx) => {
+            // menu 已按 adminOnly 拦截非管理员；这里再独立校验一次，确保即使
+            // 命令注册被绕过，真实环境也不会对非管理员开放。
+            if (!isAdminMessage(message, ctx.config)) {
+              await ctx.replyText(message, "权限不足，仅管理员可发起真实环境任务。");
+              return;
+            }
+            const content = args.join(" ").trim();
+            if (!content) {
+              await ctx.replyText(message, `用法：${prefix}real-work <任务>\n例如：${prefix}real-work 重启测试服务并检查日志`);
+              return;
+            }
+            const realWorkDirective = [
+              "[$real-work 命令指令]",
+              `管理员通过 ${prefix}real-work 命令请求在真实环境中完成工作：“${content}”。`,
+              "这是明确的工作请求：使用真实环境工具实际完成任务，按工作协议用 send_current_reply 交付结果，不要只给出建议。",
+            ].join("\n");
+            await chatAgentPlugin.chat(message, [realWorkDirective], { mode: "agent", quote: true, environment: "real" });
+          },
+          { adminOnly: true, group: "agent" },
         );
       },
     };
@@ -991,19 +1030,13 @@ async function main() {
         mode: "batch" as const,
         messages,
         triggerIndex,
-        environment: agentEnvironmentPlugin?.getEnvironment(messages[triggerIndex] ?? messages.at(-1)!),
+        environment: "restricted" as const,
       };
       const appends = await pluginManager.buildDynamicPromptAppends(input);
       const result: ChatRunResult = chatAgentPlugin
         ? await chatAgentPlugin.chatBatch(messages, appends, triggerIndex)
         : {
-          text: await llm.chatBatch(
-            messages,
-            appends,
-            triggerIndex,
-            input.environment,
-            agentEnvironmentPlugin?.getSessionKey(messages[triggerIndex] ?? messages.at(-1)!),
-          ),
+          text: await llm.chatBatch(messages, appends, triggerIndex),
           delivered: false,
         };
       if (input.environment === "restricted") {
@@ -1083,10 +1116,9 @@ async function main() {
     const blocked = await pluginManager.processMessage(message);
     if (blocked) return;
 
-    const environment = agentEnvironmentPlugin?.getEnvironment(message) ?? "restricted";
-    if (environment === "restricted") {
-      messageStore.appendIncoming(message);
-    }
+    // 普通消息流一律受限环境；真实环境只存在于管理员显式发起的 $real-work 任务内。
+    const environment = "restricted" as const;
+    messageStore.appendIncoming(message);
 
     const shouldReply = await pluginManager.shouldReply(message);
     if (!shouldReply) return;
@@ -1096,22 +1128,15 @@ async function main() {
       const result: ChatRunResult = chatAgentPlugin
         ? await chatAgentPlugin.chat(message, dynamicAppends)
         : {
-          text: await llm.chat(
-            message,
-            dynamicAppends,
-            environment,
-            agentEnvironmentPlugin?.getSessionKey(message),
-          ),
+          text: await llm.chat(message, dynamicAppends),
           delivered: false,
         };
-      if (environment === "restricted") {
-        try {
-          // 关联 bot 回复实际发出的 message_id（可能多条，取第一条；由 chat 层经
-          // onSentMessageIds 回传），供用户之后引用该消息时通过 findMessageById 回溯。
-          messageStore.appendReply(message, result.text, result.deliveredMessageIds?.[0]);
-        } catch (err) {
-          console.error("[MessageStore] 存储回复失败:", err);
-        }
+      try {
+        // 关联 bot 回复实际发出的 message_id（可能多条，取第一条；由 chat 层经
+        // onSentMessageIds 回传），供用户之后引用该消息时通过 findMessageById 回溯。
+        messageStore.appendReply(message, result.text, result.deliveredMessageIds?.[0]);
+      } catch (err) {
+        console.error("[MessageStore] 存储回复失败:", err);
       }
       if (!result.delivered) {
         await sendReply(message, result.text);

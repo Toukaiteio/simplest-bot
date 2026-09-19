@@ -13,7 +13,7 @@ export function createAgentRealToolRegistrations(config: BotConfig): BotToolRegi
         type: "function",
         function: {
           name: "agent_real_exec_command",
-          description: "在管理员真实环境流中执行命令。可访问物理环境与任意 cwd；仅管理员在 $agent-real enter 后可用。命令有 120 秒超时和输出上限。",
+          description: "在管理员真实环境任务中执行命令。可访问物理环境与任意 cwd；仅管理员通过 $real-work 发起的任务可用。命令有 120 秒超时和输出上限。",
           parameters: {
             type: "object",
             properties: {
@@ -44,7 +44,8 @@ export function createAgentRealToolRegistrations(config: BotConfig): BotToolRegi
             timeout: timeoutMs,
             maxBuffer: 256 * 1024,
             windowsHide: true,
-            shell: process.env.ComSpec || "cmd.exe",
+            // Linux 无 ComSpec；POSIX 上 execSync 默认 /bin/sh，这里显式声明避免回退到 cmd.exe。
+            shell: process.env.ComSpec || (process.platform === "win32" ? "cmd.exe" : "/bin/sh"),
           });
           return JSON.stringify({
             cwd,

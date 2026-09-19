@@ -484,9 +484,15 @@ export type ChatDeliveryOptions = {
   voice?: boolean;
   /**
    * 会话模式：standard 标准 AI 助手（无工具、无工作协议，默认）；agent 工具工作代理。
-   * 会话上下文按路径独立维护：standard / voice（$voice）/ agent（$work、$agent-real）。
+   * 会话上下文按路径独立维护：standard / voice（$voice）/ agent（$work）/ real（$real-work）。
    */
   mode?: "standard" | "agent";
+  /**
+   * 请求以真实环境运行（宿主 shell、桌面、浏览器等 admin-real 工具）。
+   * 仅当触发消息来自配置的管理员时生效；非管理员即使声明也会被降级为受限环境。
+   * 这是获取真实环境的唯一入口（$real-work），不存在持续开启的会话状态。
+   */
+  environment?: AgentEnvironment;
   /**
    * 内部回传通道：每条物理消息发送成功后回调其真实 message_id（可能多条）。
    * chat 层用它把最终交付与真实 message_id 关联，随 ChatRunResult.deliveredMessageIds
